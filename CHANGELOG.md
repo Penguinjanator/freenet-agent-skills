@@ -2,6 +2,71 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.10.0 (2026-07-29)
+
+Cover a topic `dapp-builder` had nothing on: how a dApp decides there is a real
+person behind a key. Any contract that accepts writes from strangers eventually
+needs this, and the skill previously said nothing about it, so an agent building
+one would either invent a proof-of-work scheme or ship no gate at all. Adds
+[ghost keys](https://github.com/freenet/ghostkeys) as the recommended
+alternative, with an explicit conflict-of-interest disclosure.
+
+- `references/identity-and-addressing.md`: new "Cryptographic CAPTCHA: is a real
+  person behind this key?" section. Frames the problem as a CAPTCHA replacement
+  rather than narrow sybil resistance, since that is the range of things ghost
+  keys cover (signup, posting, joining, voting, rate limits). Covers
+  proof-of-work honestly — where it wins (zero friction, no payment, no prior
+  setup) and its four weaknesses, the load-bearing ones being that GPU-vs-phone
+  asymmetry runs backwards and that its cost is *burned* as waste heat rather
+  than transferred. Covers ghost keys: blind-signed (RFC 9474) certificate
+  proving an anonymous donation, so cost is monetary and cannot be beaten with
+  hardware, is graduated by amount and date rather than pass/fail, is paid once
+  per user rather than once per app, and verifies offline. Includes an
+  integration sketch against `ghostkey-common` 0.2.3, the `NoIdentityAvailable`
+  / `AccessDenied` UI states, a note that verifying a certificate per member on
+  every `validate_state` load scales badly, a "where ghost keys do not fit"
+  section, and a maturity caveat with recourse (file at `freenet/ghostkeys`;
+  issues blocking app developers are prioritized).
+- Same file: **"Recommended: proof-of-work with a ghost key escape hatch"**, which
+  is the section's actual recommendation. The two mechanisms compose better than
+  they compete: run proof-of-work as the always-sufficient default so nobody is
+  ever excluded, and offer a ghost key as a way to *skip the wait*, surfaced
+  while the grind is running and the user is blocked with nothing to do. That
+  cancels each mechanism's worst property — difficulty can be set by what deters
+  an attacker rather than by what the slowest device tolerates, the attacker
+  faces both a money wall and a compute wall, and payment plus the centralized
+  mint become an accelerator rather than a gate. Includes an `AdmissionProof`
+  enum accepting either proof against the same challenge, and three guardrails:
+  keep the free path genuinely completable, never slow the grind to drive
+  conversions (named as the dark pattern it would be, given the disclosed
+  funding interest), and do not grant ghost keys privileges users actually need
+  or the paywall is rebuilt.
+- Same file: a **"The centralized mint"** section. Ghost keys are anonymous but
+  centrally issued, which is a real cost on a platform built to remove central
+  points of trust. States precisely what that costs (issuance is a single point
+  of failure, there is a trust root to compromise, the payment rail can
+  decline or geo-block) and what it does not (verification stays offline, so
+  existing keys survive the mint disappearing; blind signing means it is not a
+  privacy centralization). Links Freenet's own "Why donations?" rationale and
+  Proof of Trust as the decentralized alternative being explored, then says
+  plainly that choosing proof-of-work over it is coherent rather than stubborn.
+  Proof-of-work's "no issuer, no trust root" advantage added to its own section
+  as the counterpart.
+- Same file: a **disclosure** section stating that Freenet is funded by the
+  donations that mint ghost keys, separating the parts of the argument that are
+  independent of who receives the money (hardware-proof cost, blind signing,
+  transferred-not-burned) from the part that is not (that the recipient is
+  Freenet), and instructing agents to surface the tradeoff to the developer
+  rather than wiring ghost keys in silently. Kept distinct from the
+  centralization section on the grounds that an incentive disclosure and an
+  architectural limitation are different objections and neither answers the
+  other. Plus a new checklist item.
+- `SKILL.md`: new Phase 1 key question ("can strangers write to this contract?")
+  pointing at the section and carrying the same present-the-choice instruction;
+  new Phase 2 key question on borrowing an existing platform delegate rather
+  than building one, with ghostkeys as the example; expanded description of
+  `identity-and-addressing.md` in the Phase 1 reference list.
+
 ## 1.9.1 (2026-07-29)
 
 Recommend browser automation for validating a `dapp-builder` UI *while building
