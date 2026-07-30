@@ -35,7 +35,8 @@ impl ContractInterface for MyContract {
     ) -> Result<StateSummary<'static>, ContractError>;
 
     /// Generate state delta from summary (what the requester is missing).
-    /// MUST return zero bytes when the summary already matches this state.
+    /// MUST NOT return the state, or anything near its size, when the summary
+    /// already matches this state; SHOULD return zero bytes.
     fn get_state_delta(
         parameters: Parameters<'static>,
         state: State<'static>,
@@ -147,40 +148,59 @@ pub trait ComposableState {
 }
 ```
 
-## The Delta to an Up-to-Date Peer Must Be Zero Bytes
+## The Delta to an Up-to-Date Peer
 
-`get_state_delta(state, summary)` MUST return a literally empty `StateDelta`
-(`vec![]`, zero bytes) whenever `summary` equals `summarize_state(state)`. If a
-peer's summary matches your state, that peer already holds everything you have,
-so there is nothing to send.
+When a peer's summary shows it already holds everything your state has, the delta
+you owe it carries no information, and its size has to reflect that. Three tiers:
 
-Peers reconcile by exchanging summaries and asking each other for deltas. Core
-decides whether a neighbour is up to date by running your `get_state_delta`
-against that neighbour's summary and checking whether the result is empty:
-zero bytes means converged, so skip the broadcast. Your contract is what answers
-that question. A contract that never returns an empty delta answers "this peer
-is stale" every time, so it re-ships data the peer already has on every
-reconciliation, forever, and the pair never registers as converged.
+- **MUST NOT** return a delta that contains the state, or whose size approaches
+  the state's. This is the real defect.
+- **SHOULD** return a literally empty `StateDelta` (`vec![]`, zero bytes). It is
+  the unambiguous "converged" answer, and it is what `freenet-scaffold` gives you
+  for free.
+- **Acceptable:** a small fixed amount of encoding framing, the tens of bytes you
+  get from serializing a delta struct whose fields are all empty. Prefer zero,
+  but this is not a bug and the network will not penalise it.
 
-**Empty means zero bytes, not "a struct whose fields are all empty".** This is
-the part that is easy to get wrong. A CBOR or bincode encoding of a struct of
-nine `Option::None` fields is semantically empty, but it is 10-15 bytes on the
-wire, and core cannot tell those bytes from real content.
+What matters is delta size **relative to state size**, not the exact byte count.
+Twenty bytes against a 500 KB state is fine. A state-sized delta is not. Those
+are five orders of magnitude apart, and no encoding choice moves a contract
+across that gap.
+
+Peers reconcile by exchanging summaries and asking each other for deltas. Core's
+converged test has two steps: byte-identical summaries count as converged
+outright, and when the summary bytes differ, core runs your `get_state_delta`
+against that peer's summary and treats a zero-byte result as converged. Your
+contract answers the second question.
+
+That is what the three tiers are measuring. A delta that is empty in meaning but
+not in bytes still fails the second check, so core reads "this peer is stale" and
+sends it; at a few tens of bytes that is cheap, which is why it is tolerable. A
+state-sized delta fails the same check while costing the entire state, on every
+reconciliation, forever.
+
+### Aim for zero bytes
+
+Zero is worth aiming for because it is the only result that passes core's second
+check. Note that "empty" here means zero bytes rather than "a struct whose fields
+are all empty": serializing an all-`None` delta struct still costs about a byte
+per field with bincode, and tens of bytes with CBOR, because ciborium writes the
+field names.
 
 ```rust
-// WRONG: always returns bytes, so the peer never looks converged.
+// Returns bytes even with nothing to send, so this never gives the converged signal.
 let delta = MyStateDelta {
     members: None,
     messages: None,
     config: None,
 };
 let mut delta_bytes = vec![];
-into_writer(&delta, &mut delta_bytes)?;   // ~12 bytes of CBOR framing, not 0
+into_writer(&delta, &mut delta_bytes)?;   // 28 bytes of CBOR framing, not 0
 Ok(StateDelta::from(delta_bytes))
 ```
 
 ```rust
-// RIGHT: collapse "no changes" to zero bytes before serializing.
+// Better: collapse "no changes" to zero bytes before serializing.
 match my_state.delta(&my_state, &parameters, &summary) {
     Some(d) => {
         let mut delta_bytes = vec![];
@@ -191,31 +211,43 @@ match my_state.delta(&my_state, &parameters, &summary) {
 }
 ```
 
-With `freenet-scaffold`, the `#[composable]` derive does the collapse for you:
-the generated `delta()` checks whether every field's delta is `None` and returns
-`None` for the whole struct if so, which is what makes the `match` above work.
-This is the mechanism River relies on. A contract that hand-rolls
-`get_state_delta`, or that composes state without the derive, has no such
-collapse and will serialize the all-`None` struct, so do the check yourself.
+**Whether you get the first shape or the second depends on how you built your
+state.** With `freenet-scaffold`, the `#[composable]` derive does the collapse for
+you: the generated `delta()` checks whether every field's delta is `None` and
+returns `None` for the whole struct if so, which is what makes the `match` above
+work. That is why River returns zero bytes. If you hand-roll `get_state_delta`,
+or compose state without the derive, your delta type is probably a plain struct
+that is never `None`, so you get the framing bytes unless you add the collapse
+yourself. That is tolerable rather than broken, but the collapse is two lines, so
+add it.
 
 Two related rules:
 
 - **Read the `summary` argument.** A `get_state_delta` that ignores it and
-  returns the whole state can never produce an empty delta.
+  returns the whole state is the MUST NOT case.
 - **`summarize_state(S)` must be far smaller than `S`.** A summary the size of
   the state defeats delta computation entirely, and a summary that is a copy of
   the state is always a bug.
 
-Pin all of this with a test:
+Pin all of this with a test. Assert the size bound, which is the requirement, and
+tighten to `== 0` only if your contract collapses to an empty delta:
 
 ```rust
 #[test]
-fn delta_to_an_up_to_date_peer_is_empty() {
+fn delta_to_an_up_to_date_peer_is_negligible() {
     let state = /* a populated state */;
     let summary = MyContract::summarize_state(params.clone(), state.clone()).unwrap();
     let delta = MyContract::get_state_delta(params, state.clone(), summary.clone()).unwrap();
 
-    assert_eq!(delta.size(), 0, "delta to an up-to-date peer must be zero bytes");
+    // The requirement: no state, nothing close to state-sized. 256 bytes leaves
+    // room for encoding framing on a wide struct and is still orders of
+    // magnitude below any real state.
+    assert!(
+        delta.size() < 256,
+        "delta to an up-to-date peer was {} bytes against a {} byte state",
+        delta.size(),
+        state.as_ref().len()
+    );
     assert!(
         summary.size() < state.as_ref().len() / 4,
         "summary must be much smaller than state"
@@ -223,15 +255,15 @@ fn delta_to_an_up_to_date_peer_is_empty() {
 }
 ```
 
-Getting this wrong is expensive for the whole network, not only for your app. One
-contract live on Freenet today breaks every rule above: its `get_state_delta`
-never reads the summary, and its `summarize_state` returns a full copy of the
-state, so summary and state are both 24 KB, every comparison mismatches, and
-every reconciliation re-ships the entire state. It accounts for 55.6% of all
-broadcast sends on the network, from a static page that has not changed since
+Getting the MUST NOT wrong is expensive for the whole network, not only for your
+app. One contract live on Freenet today never reads the summary and returns its
+whole state as the delta, 25,403 bytes against a 24,832-byte state, and its
+`summarize_state` returns a full copy of the state as well, so every comparison
+mismatches and every reconciliation re-ships everything. It accounts for 55.6% of
+all broadcast sends on the network, from a static page that has not changed since
 February ([freenet/freenet-core#5056](https://github.com/freenet/freenet-core/issues/5056)).
-Core is adding a probe that flags contracts whose self-delta is non-empty, so a
-contract that gets this wrong will end up suppressed rather than merely slow.
+Core is adding a probe for this, so a contract that ships state to peers that
+already have it will end up suppressed rather than merely slow.
 
 ## Commutative Monoid Requirement
 

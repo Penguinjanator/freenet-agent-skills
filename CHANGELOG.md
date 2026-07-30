@@ -2,6 +2,54 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.10.2 (2026-07-30)
+
+Correct the delta requirement added in 1.10.1. That version stated it as a flat
+"`get_state_delta` MUST return zero bytes to an up-to-date peer", which is wrong
+as a hard rule and would mark a correct live app noncompliant.
+
+Atlas's index contract hand-rolls `get_state_delta` around a plain, non-`Option`
+delta struct and serializes it unconditionally, so against its own summary it
+returns `IndexDelta { key_auth: None, records: [] }`, about 20 bytes of CBOR
+rather than zero (ciborium serializes structs as maps and writes the field
+names). Atlas is behaving correctly. It has no all-`None` collapse because it
+does not use `freenet-scaffold`; River clears the zero-byte bar only because the
+`#[composable]` macro gives it one. A rule that flags Atlas is a false positive
+aimed at a real app.
+
+The requirement is now three tiers:
+
+- **MUST NOT** return a delta containing the state, or approaching its size. This
+  is the actual defect: freenet/freenet-core#5056 returns 25,403 bytes against a
+  24,832-byte state.
+- **SHOULD** return a literally empty `StateDelta`. Zero bytes is the only result
+  that passes core's converged check.
+- **Acceptable**: a few tens of bytes of encoding framing from an all-empty
+  struct. Not ideal, not a bug, no penalty.
+
+The discriminator is delta size relative to state size, not an absolute byte
+count. Roughly 20 bytes against a 500 KB state versus a state-sized delta is five
+orders of magnitude, and no encoding choice moves a contract across that gap.
+
+- `references/contract-patterns.md`: section retitled "The Delta to an Up-to-Date
+  Peer" and restated in the three tiers. The all-`None` code block is now framed
+  as why you may see a few tens of bytes and why that is tolerable, rather than
+  as a defect, and the byte figure is corrected (28 bytes measured for the
+  three-field CBOR example, against the 10-15 claimed in 1.10.1, which assumed an
+  encoding that does not write field names). Adds the actionable difference for
+  an author: `#[composable]` gives you zero bytes for free, a hand-rolled
+  `get_state_delta` has to add the collapse itself. Describes core's converged
+  test as it actually works, byte-identical summaries first and the
+  `get_state_delta` probe only when summary bytes differ
+  (`ring/interest.rs`, `broadcast_queue.rs`). The test now asserts the size bound
+  that is the real requirement rather than `== 0`.
+- `SKILL.md`: same reframing in the *Data Synchronization & Consistency*
+  paragraph and Phase 1 step 4.
+
+The companion stdlib change carries the same correction: the "may result in the
+contract being deprioritized or removed" consequence is scoped to the MUST NOT
+tier only (freenet/freenet-stdlib#90).
+
 ## 1.10.1 (2026-07-30)
 
 Document a contract-correctness requirement that was previously undocumented
