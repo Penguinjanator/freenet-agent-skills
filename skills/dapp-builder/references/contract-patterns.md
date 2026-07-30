@@ -28,12 +28,14 @@ impl ContractInterface for MyContract {
     ) -> Result<UpdateModification<'static>, ContractError>;
 
     /// Generate concise state summary for delta computation
+    /// (MUST be much smaller than the state)
     fn summarize_state(
         parameters: Parameters<'static>,
         state: State<'static>,
     ) -> Result<StateSummary<'static>, ContractError>;
 
-    /// Generate state delta from summary (what the requester is missing)
+    /// Generate state delta from summary (what the requester is missing).
+    /// MUST return zero bytes when the summary already matches this state.
     fn get_state_delta(
         parameters: Parameters<'static>,
         state: State<'static>,
@@ -144,6 +146,92 @@ pub trait ComposableState {
     ) -> Result<(), String>;
 }
 ```
+
+## The Delta to an Up-to-Date Peer Must Be Zero Bytes
+
+`get_state_delta(state, summary)` MUST return a literally empty `StateDelta`
+(`vec![]`, zero bytes) whenever `summary` equals `summarize_state(state)`. If a
+peer's summary matches your state, that peer already holds everything you have,
+so there is nothing to send.
+
+Peers reconcile by exchanging summaries and asking each other for deltas. Core
+decides whether a neighbour is up to date by running your `get_state_delta`
+against that neighbour's summary and checking whether the result is empty:
+zero bytes means converged, so skip the broadcast. Your contract is what answers
+that question. A contract that never returns an empty delta answers "this peer
+is stale" every time, so it re-ships data the peer already has on every
+reconciliation, forever, and the pair never registers as converged.
+
+**Empty means zero bytes, not "a struct whose fields are all empty".** This is
+the part that is easy to get wrong. A CBOR or bincode encoding of a struct of
+nine `Option::None` fields is semantically empty, but it is 10-15 bytes on the
+wire, and core cannot tell those bytes from real content.
+
+```rust
+// WRONG: always returns bytes, so the peer never looks converged.
+let delta = MyStateDelta {
+    members: None,
+    messages: None,
+    config: None,
+};
+let mut delta_bytes = vec![];
+into_writer(&delta, &mut delta_bytes)?;   // ~12 bytes of CBOR framing, not 0
+Ok(StateDelta::from(delta_bytes))
+```
+
+```rust
+// RIGHT: collapse "no changes" to zero bytes before serializing.
+match my_state.delta(&my_state, &parameters, &summary) {
+    Some(d) => {
+        let mut delta_bytes = vec![];
+        into_writer(&d, &mut delta_bytes)?;
+        Ok(StateDelta::from(delta_bytes))
+    }
+    None => Ok(StateDelta::from(vec![])),
+}
+```
+
+With `freenet-scaffold`, the `#[composable]` derive does the collapse for you:
+the generated `delta()` checks whether every field's delta is `None` and returns
+`None` for the whole struct if so, which is what makes the `match` above work.
+This is the mechanism River relies on. A contract that hand-rolls
+`get_state_delta`, or that composes state without the derive, has no such
+collapse and will serialize the all-`None` struct, so do the check yourself.
+
+Two related rules:
+
+- **Read the `summary` argument.** A `get_state_delta` that ignores it and
+  returns the whole state can never produce an empty delta.
+- **`summarize_state(S)` must be far smaller than `S`.** A summary the size of
+  the state defeats delta computation entirely, and a summary that is a copy of
+  the state is always a bug.
+
+Pin all of this with a test:
+
+```rust
+#[test]
+fn delta_to_an_up_to_date_peer_is_empty() {
+    let state = /* a populated state */;
+    let summary = MyContract::summarize_state(params.clone(), state.clone()).unwrap();
+    let delta = MyContract::get_state_delta(params, state.clone(), summary.clone()).unwrap();
+
+    assert_eq!(delta.size(), 0, "delta to an up-to-date peer must be zero bytes");
+    assert!(
+        summary.size() < state.as_ref().len() / 4,
+        "summary must be much smaller than state"
+    );
+}
+```
+
+Getting this wrong is expensive for the whole network, not only for your app. One
+contract live on Freenet today breaks every rule above: its `get_state_delta`
+never reads the summary, and its `summarize_state` returns a full copy of the
+state, so summary and state are both 24 KB, every comparison mismatches, and
+every reconciliation re-ships the entire state. It accounts for 55.6% of all
+broadcast sends on the network, from a static page that has not changed since
+February ([freenet/freenet-core#5056](https://github.com/freenet/freenet-core/issues/5056)).
+Core is adding a probe that flags contracts whose self-delta is non-empty, so a
+contract that gets this wrong will end up suppressed rather than merely slow.
 
 ## Commutative Monoid Requirement
 

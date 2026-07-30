@@ -2,6 +2,41 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.10.1 (2026-07-30)
+
+Document a contract-correctness requirement that was previously undocumented
+anywhere: **`get_state_delta(S, summarize_state(S))` must return a literally
+empty `StateDelta`, zero bytes.** If a peer's summary matches your state, that
+peer already holds everything you have, so there is nothing to send. A contract
+that returns anything non-empty there re-ships data the peer already has on
+every reconciliation, forever, and the two peers never register as converged.
+
+The trap is that "empty" must mean zero bytes rather than "a struct whose fields
+are all empty": a CBOR or bincode encoding of a struct of all-`None` fields is
+10-15 bytes on the wire and core cannot tell that from real content. River gets
+this right via a mechanism an author may not realise they depend on, the
+`freenet-scaffold` `#[composable]` derive collapsing an all-`None` delta struct
+to `None`, which the room contract maps to `StateDelta::from(vec![])`. A
+contract that hand-rolls `get_state_delta` has no such collapse.
+
+This is currently costing the network real bandwidth: one live contract never
+reads the summary argument and returns its whole state as its delta, and is
+55.6% of all broadcast sends on Freenet (freenet/freenet-core#5056). Core is
+adding a probe that will flag violating contracts, so the guidance needs to
+exist before the enforcement does.
+
+- `references/contract-patterns.md`: new "The Delta to an Up-to-Date Peer Must
+  Be Zero Bytes" section next to the commutative monoid requirement, showing the
+  wrong shape (serializing an all-`None` struct) beside the right one, the
+  `freenet-scaffold` collapse that River relies on, and a test pinning both the
+  zero-byte self-delta and the summary-much-smaller-than-state signal. The
+  `ContractInterface` trait listing now carries the requirement inline on
+  `get_state_delta` and `summarize_state`, matching the existing
+  "MUST be commutative" convention on `update_state`.
+- `SKILL.md`: states the requirement where Summaries and Deltas are introduced
+  under "Data Synchronization & Consistency", and folds it into Phase 1
+  implementation step 4 alongside the commutative monoid requirement.
+
 ## 1.10.0 (2026-07-29)
 
 Cover a topic `dapp-builder` had nothing on: how a dApp decides there is a real
