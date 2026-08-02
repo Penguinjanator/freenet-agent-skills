@@ -52,6 +52,8 @@ A single UI typically talks to *all* of an app's contracts and delegates.
   - Built using standard web frameworks (Dioxus, React, Vue, etc.)
   - Agnostic to underlying P2P network complexity
 
+**"Native app" above means desktop.** Freenet does not currently support running a full node on mobile devices. Do not recommend or generate a production mobile wrapper without clearly warning about likely bandwidth, battery, thermal, CPU, and background-execution problems. Treat any such work as experimental, require explicit resource measurements before calling it viable, and do not represent it as an official Freenet client without approval from the Freenet Project.
+
 ## How Contract Keys Work (and Why Freenet is Trustless)
 
 Now that contracts have been introduced, here's how they're addressed in the network.

@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.10.5 (2026-08-01)
+
+Warn against unqualified mobile deployment. `SKILL.md` listed the UI's
+location as "Web Browser (SPA) or native app" with no caveat, which reads
+as license to generate a mobile wrapper on request.
+
+- `SKILL.md`: note under the User Interface component that "native app"
+  means desktop — Freenet does not currently support running a full node
+  on mobile. Any production mobile wrapper must be clearly flagged as
+  experimental, with likely bandwidth/battery/thermal/CPU/background-
+  execution problems called out, resource measurements required before
+  it's called viable, and no representation as an official Freenet client
+  without Freenet Project approval.
+
 ## 1.10.4 (2026-08-01)
 
 Publish as an npm package for OpenCode compatibility (originally PR #4). Adds
