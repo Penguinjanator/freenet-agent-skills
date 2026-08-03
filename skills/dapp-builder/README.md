@@ -38,9 +38,7 @@ ln -s ~/freenet-agent-skills/skills/dapp-builder ~/.claude/skills/
 
 Once installed, Claude will automatically use this skill when you ask about building Freenet apps. You can also invoke it directly:
 
-- "Help me design a contract for a voting app"
-- "How do I implement a delegate for key storage?"
-- "Set up a Freenet dApp project structure"
+- "Build a decentralized Reddit clone"
 
 ## Files
 
