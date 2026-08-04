@@ -2,6 +2,7 @@
 name: codebase-investigator
 description: Performs parallel readonly investigation of a codebase to gather evidence for debugging. Searches for patterns, checks git history, reads related files. Use when debugging to parallelize evidence gathering.
 tools: Read, Grep, Glob, Bash, WebSearch
+model: sonnet
 ---
 
 # Codebase Investigator Agent

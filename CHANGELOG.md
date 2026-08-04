@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.14.0 (2026-08-04)
+
+Pin the coverage-oriented review agents to Sonnet. They previously carried no
+`model:` field, so every one of them inherited Opus from the session — and a
+Full-tier review spawns four or five at once.
+
+Measured over the Aug 2-4 window on the uprizer account: subagent sidechains
+were 13,007 of 19,615 API calls and roughly 58% of consumption. These agents
+read a diff and report `file:line` findings; that is not work that needs Opus.
+
+- `big-picture-reviewer`, `testing-reviewer`, `code-first-reviewer`,
+  `codebase-investigator`: `model: sonnet`.
+- `skeptical-reviewer` deliberately stays on the session model. It is the
+  adversarial bug-hunt lens and the main regression defense, which is the
+  thing least worth economizing on.
+
 ## 1.13.0 (2026-08-03)
 
 Two additions to the ghost key purchase round trip, both from watching the flow

@@ -2,6 +2,7 @@
 name: testing-reviewer
 description: Reviews test coverage for PR changes, analyzing whether changes are adequately tested at appropriate levels (unit, integration, simulation). Use as part of parallel review process.
 tools: Read, Grep, Glob, Bash, WebSearch
+model: sonnet
 ---
 
 # Testing Reviewer Agent

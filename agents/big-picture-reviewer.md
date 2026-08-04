@@ -2,6 +2,7 @@
 name: big-picture-reviewer
 description: Reviews PRs for alignment with stated goals, detects "CI chasing" anti-patterns, and ensures AI agent/skill instructions stay up to date with code changes. Critical for catching removed tests/fixes and stale automation rules.
 tools: Read, Grep, Glob, Bash, WebSearch
+model: sonnet
 ---
 
 # Big Picture Reviewer Agent
