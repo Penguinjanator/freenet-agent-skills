@@ -120,9 +120,21 @@ carry forward.
 
 ## The one truth that shapes everything
 
-Freenet keys are `BLAKE3(code_hash || params)`, so **any** change to contract or
-delegate WASM produces a new address. There is no in-place upgrade. An upgrade is
-always "deploy a new contract/delegate at a new address and migrate state to it."
+Freenet keys are `BLAKE3(code_hash || params)`, so **any change to contract or
+delegate WASM produces a new address**. For a WASM change there is no in-place
+upgrade: it is always "deploy at a new address and migrate state to it."
+
+**Scope this correctly — it is about WASM, not about content.** Changing a
+contract's *state* is an ordinary update at an unchanged address, and that is a
+first-class upgrade path, not a loophole:
+
+- **Your webapp is state.** Shipping a new UI build is an in-place update of a
+  web container contract at a permanent URL. It re-keys nothing, and needs no
+  migration and no redirect contract. See `web-container-contract.md`.
+- **This whole document is about the other case** — your data contracts and
+  delegates, where the WASM itself changes and state has to be carried forward.
+
+Everything below applies to the WASM-change case.
 
 Therefore **the entire risk surface of an upgrade is the migration.** Don't aim
 for "risk-free upgrades" (impossible); aim for migrations that are *idempotent,
@@ -263,6 +275,9 @@ and verify by mutation that removing the fix fails the test.
 
 ## References
 
+- `references/web-container-contract.md` — the *other* upgrade path: shipping a
+  new UI is an in-place state update at a permanent URL, with no re-key and no
+  migration. Read it before assuming a release rotates anything.
 - `references/contract-patterns.md` — contract upgrade mechanics: the shipped
   backward-probe baseline (reconstruct old keys from a committed
   `legacy_contracts.toml` registry, GET old state, re-PUT under the current key),

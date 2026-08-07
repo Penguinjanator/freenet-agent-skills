@@ -2,6 +2,50 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.18.0 (2026-08-06)
+
+Webapps are upgraded IN PLACE at a permanent URL. The skill said the opposite.
+
+A dApp developer built their own redirect contract to get a stable URL, because
+the skill told them every release rotates it. It doesn't. A web container
+contract's key is `BLAKE3(container_wasm || publisher_key)`, and the UI is
+neither — it is the contract's *state*. Rebuilding a UI cannot move its address.
+River has published dozens of releases to one unchanging key this way, and
+`fdev website update` is the supported one-command path.
+
+The skill contradicted itself: `delegate-patterns.md` stated the mechanism
+correctly, while `facade-pattern.md` opened on the false premise and `SKILL.md`
+told every developer shipping more than one release to plan a facade contract
+"from day one" — i.e. to hand-build exactly the redirect that isn't needed.
+
+- Adds `references/web-container-contract.md`: how a webapp is addressed, why
+  the URL is permanent, `fdev website init/publish/update`, and the operational
+  hazards around it — including one that permanently bricks a live site.
+  `fdev` versions are unix seconds (~1.78e9), so replacing them with a
+  hand-rolled counter seeded below that value makes every future publish fail
+  forever, with no recovery. The page now says to keep fdev's versioning unless
+  you have a reason not to, and to seed strictly above the current on-network
+  version if you switch.
+- Documents the `--contract-wasm` pin as a real trade-off rather than a free
+  win: it buys a permanently stable address and costs you a frozen container
+  implementation that can no longer receive upstream fixes. Also covers where
+  the WASM actually comes from (rebuilding it from source yields different
+  bytes and silently publishes to a new URL), and that `fdev website list` and
+  `init` ignore the pin and will report a different key after an fdev upgrade.
+- Covers unrecoverable signing-key loss with real custody guidance (three
+  backups, `chmod 600` since `init` doesn't, and the macOS config path, since
+  backing up the wrong path looks identical to having a backup), the 50 MiB
+  state cap, and rehearsing the first publish against a local node.
+- Rewrites `facade-pattern.md` around what it is actually for: moving an
+  audience to a *different* contract after a deliberate container-WASM
+  migration or key rotation. Not release mechanics.
+- Corrects `build-system.md`'s "contract ID reproducibility caveat", which
+  blamed ID rotation on the signer's timestamp. That timestamp goes into the
+  webapp metadata, which is state; it changes the state at an unchanged ID,
+  which is the upgrade mechanism itself.
+- Scopes `upgrade-and-migration.md`'s "there is no in-place upgrade" to WASM
+  changes, since read flatly it is the sentence that causes this whole mistake.
+
 ## 1.17.0 (2026-08-04)
 
 Document where large binary assets (audio, video, images, uploads) belong:

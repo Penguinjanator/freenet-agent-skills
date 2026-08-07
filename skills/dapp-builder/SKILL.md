@@ -51,6 +51,13 @@ A single UI typically talks to *all* of an app's contracts and delegates.
   - Connects to the local Freenet Kernel via WebSocket/HTTP
   - Built using standard web frameworks (Dioxus, React, Vue, etc.)
   - Agnostic to underlying P2P network complexity
+- **How it is published and addressed:** the UI ships as the *state* of a **web
+  container contract** — a generic, pre-built contract whose params are your
+  32-byte publisher key. Because neither key input contains your UI, **your
+  webapp has one permanent URL and is upgraded in place**: `fdev website update`
+  publishes v2 to the same address users bookmarked. Do not design around a
+  rotating URL, and do not build a redirect contract to work around one. See
+  `references/web-container-contract.md`.
 
 **"Native app" above means desktop.** Freenet does not currently support running a full node on mobile devices. Do not recommend or generate a production mobile wrapper without clearly warning about likely bandwidth, battery, thermal, CPU, and background-execution problems. Treat any such work as experimental, require explicit resource measurements before calling it viable, and do not represent it as an official Freenet client without approval from the Freenet Project.
 
@@ -272,13 +279,23 @@ Set up the build system, CI, and deployment pipeline.
    with the GNU flags listed under "Tooling Preflight" in
    `references/build-system.md`.
 
-7. **If you'll ship more than one release, plan for a facade contract
-   from day one.** Without it, every release rotates the gateway URL
-   users have bookmarked. The facade is a stable-URL indirection: a
-   never-rebuilt contract whose state holds a signed pointer to the
-   current web-container. See `references/facade-pattern.md`. Cheaper
-   to design in now than retrofit later — retrofitting means asking
-   every existing user to update their bookmark.
+7. **Publish the UI as a web container contract — its URL is permanent, and
+   you upgrade in place.** Shipping a new release does **not** rotate the
+   gateway URL: the UI is the container's *state*, while the contract key is
+   `BLAKE3(BLAKE3(container_wasm) || publisher_key)` and neither input contains
+   your UI.
+   `fdev website init` once (it prints your URL and writes your signing key),
+   then `fdev website publish` / `fdev website update` for every release
+   thereafter. **Back up the signing key on day one** — lose it and the site is
+   frozen at its last version forever, and no redirect can rescue it. Keep
+   `fdev`'s built-in versioning unless you have a concrete reason not to: a
+   hand-rolled counter seeded *below* the stored version bricks the site
+   permanently, so if you must switch, seed strictly above the current
+   on-network version. Whether to pin the container WASM with `--contract-wasm`
+   is a real trade-off (stable address vs. freezing a third-party contract
+   implementation) — read it before deciding. See
+   `references/web-container-contract.md`. Do **not** build a redirect/pointer
+   contract for stable URLs; you already have one.
 8. **Plan contract-WASM stability before the first release.** A
    `cargo update` in the workspace root must not silently rotate
    contract IDs. See `references/build-system.md` →
@@ -297,8 +314,12 @@ References:
   reproducibility caveat, pre-commit hook for stray `.wasm`.
 - `references/production-smoke-testing.md` — iframe shell architecture,
   Playwright recipe for post-publish liveness checks.
-- `references/facade-pattern.md` — stable-URL facade contract
-  architecture for projects that ship more than one release.
+- `references/web-container-contract.md` — how a webapp is addressed and
+  upgraded **in place** at a permanent URL, `fdev website`, version
+  monotonicity, key backup, and the size budget.
+- `references/facade-pattern.md` — indirection for the rare case where you
+  must move an audience to a *different* contract (container-WASM migration
+  or publisher-key rotation). Not needed for ordinary releases.
 - `references/upgrade-and-migration.md` — operational discipline for safe
   contract/delegate upgrades: the five migration properties (idempotent,
   resumable, non-destructive, regression-gated, observable), enumerating
