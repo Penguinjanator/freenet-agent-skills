@@ -20,7 +20,10 @@ impl ContractInterface for MyContract {
         related: RelatedContracts<'static>,
     ) -> Result<ValidateResult, ContractError>;
 
-    /// Update state with new data (MUST be commutative)
+    /// Update state with new data.
+    /// MUST be associative, commutative and idempotent — see "Merge Law
+    /// Requirements" below. Merging IS this function: core applies an incoming
+    /// full state as `update_state(current, [UpdateData::State(incoming)])`.
     fn update_state(
         parameters: Parameters<'static>,
         state: State<'static>,
@@ -265,15 +268,33 @@ February ([freenet/freenet-core#5056](https://github.com/freenet/freenet-core/is
 Core is adding a probe for this, so a contract that ships state to peers that
 already have it will end up suppressed rather than merely slow.
 
-## Commutative Monoid Requirement
+## Merge Law Requirements
 
-Contract state must form a **commutative monoid** under the merge operation. This means:
+Contract state must form a **join-semilattice** under the merge operation — in
+practice, a commutative monoid that is also **idempotent**. This means:
 
 1. **Associativity:** `merge(merge(A, B), C) == merge(A, merge(B, C))`
 2. **Commutativity:** `merge(A, B) == merge(B, A)`
-3. **Identity:** There exists an empty/initial state `I` where `merge(A, I) == A`
+3. **Idempotence:** `merge(A, A) == A`
+4. **Identity:** There exists an empty/initial state `I` where `merge(A, I) == A`
 
 This ensures that regardless of the order peers receive and apply updates, they all converge to the same final state.
+
+**Idempotence is the one most often missed, and the one the network gives you no
+way to avoid.** Delivery is at-least-once: the same state or delta legitimately
+arrives more than once, after a retry, a re-subscribe, or anti-entropy healing a
+divergence. A merge that changes the state when re-applied therefore never
+settles — each redelivery mutates it again, which produces an endless stream of
+"new" states to gossip and a contract that cannot converge no matter how healthy
+the network is.
+
+This is not hypothetical. Freenet telemetry attributed the largest single source
+of network traffic to contracts whose merges do not converge (freenet-core
+#5153), and a survey of live contracts found one whose `merge(A, A)` never reached
+a fixpoint at all (freenet-core #5320). Note that identity (`merge(A, I) == A`) does
+*not* imply idempotence (`merge(A, A) == A`): a merge that appends rather than
+unions satisfies the first and fails the second, which is exactly the shape of the
+defects found in the wild.
 
 ### Testing Commutativity
 
@@ -308,6 +329,18 @@ mod tests {
             let ab_c = a.clone().merge(&b).merge(&c);
             let a_bc = a.clone().merge(&b.clone().merge(&c));
             prop_assert_eq!(ab_c, a_bc);
+        }
+
+        /// Re-applying the same state changes nothing.
+        ///
+        /// Delivery is at-least-once, so this WILL happen in production. Merge
+        /// twice as well as once: a merge that only settles after one application
+        /// passes a naive test and still fails here.
+        #[test]
+        fn merge_is_idempotent(a in arb_state(), b in arb_state()) {
+            let once = a.clone().merge(&b);
+            let twice = once.clone().merge(&b);
+            prop_assert_eq!(once, twice);
         }
 
         /// Merging with empty state returns original
@@ -573,7 +606,7 @@ to migrate.
 Permissionless contract migration only works if all of these hold:
 
 1. **State is mergeable / commutative.** Carrying old state into the new key is a
-   merge; if the merge isn't a commutative monoid (see above), concurrent old and
+   merge; if the merge doesn't obey the merge laws (see above), concurrent old and
    new writes during the rollout window won't converge.
 2. **Every field in state is self-authorizing.** See "Cryptographic Verification"
    above. The successor's `validate_state` must re-check *every* invariant on the

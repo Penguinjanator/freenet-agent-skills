@@ -2,6 +2,36 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.21.0 (2026-08-17)
+
+The merge laws were stated as a commutative monoid: associativity, commutativity
+and identity. Idempotence was missing, which is the one Freenet's delivery model
+makes unavoidable and the one live contracts are actually breaking.
+
+- **`contract-patterns.md`: idempotence is now a stated law**, with its own
+  property test, and the section is framed as a join-semilattice rather than a
+  commutative monoid. Delivery is at-least-once, so the same state or delta
+  legitimately arrives more than once (a retry, a re-subscribe, anti-entropy
+  healing a divergence); a merge that changes the state on re-application never
+  settles, and gossips an endless stream of "new" states while doing it.
+- **Called out that identity does not imply idempotence.** `merge(A, I) == A`
+  and `merge(A, A) == A` are different requirements, and a merge that appends
+  rather than unions satisfies the first while failing the second — which is the
+  shape of the defects found in the wild.
+- **`SKILL.md`: the one-line summary named only commutativity**; it now names all
+  three laws and points at the detail.
+- **Renamed the section from "Commutative Monoid Requirement" to "Merge Law
+  Requirements"**, and updated every cross-reference. A heading naming three of
+  the four laws while the body named four is the same drift that lost idempotence
+  in the first place. The `update_state` doc comment in the trait example said
+  only "MUST be commutative"; it now names all three laws and points out that
+  merging IS `update_state`.
+
+Evidence: freenet-core #5153 attributed the largest single source of network
+traffic to contracts whose merges do not converge, and the #5320 conformance
+survey found a live contract whose `merge(A, A)` never reaches a fixpoint, plus
+three more breaking commutativity.
+
 ## 1.20.0 (2026-08-13)
 
 Two ways the recommended upgrade mechanism loses user data silently. The docs
