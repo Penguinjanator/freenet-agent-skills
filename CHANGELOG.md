@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.22.0 (2026-08-17)
+
+Canonical serialization was documented for summaries only, and the commutativity
+example stored state in a `HashMap` — teaching the defect it warns about
+elsewhere.
+
+- **State must serialize canonically, stated as a requirement.** Peers decide they
+  have converged by comparing state *bytes*, so two peers holding the same logical
+  state in a different byte order heal forever without agreeing. A `HashMap`
+  anywhere in state serializes in insertion order, which depends on the order
+  updates happened to arrive.
+- **Fixed the "Set-Based Operations" example** to use `BTreeMap` rather than
+  `HashMap<VerifyingKey, SignedMember>` for state.
+- **`SKILL.md`: the rule now covers state as well as summaries**, and says why the
+  merge laws are checked on exact bytes — canonical encoding is a platform
+  requirement (freenet-core #5320), which is what makes exact comparison correct
+  rather than over-strict.
+
 ## 1.21.0 (2026-08-17)
 
 The merge laws were stated as a commutative monoid: associativity, commutativity

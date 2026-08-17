@@ -397,7 +397,24 @@ mod tests {
 3. **Mutation during iteration:** Modifying state while iterating can produce different results
 4. **Missing items in merge:** Only keeping "newer" items without proper conflict resolution
 
-> **Determinism matters in your `Summary` type too, for a separate reason.** A
+> **The same rule applies to your STATE, and it is a requirement rather than a
+> tip.** Freenet peers decide whether they have converged by comparing state
+> *bytes*, so two peers holding the same logical state in a different byte order
+> never recognise each other as converged and heal forever. A `HashMap` (or
+> `HashSet`) anywhere in your state type serializes in iteration order, which
+> depends on insertion history, which depends on the order updates happened to
+> arrive — so the same merge on two peers yields different bytes. **Use
+> `BTreeMap`/`BTreeSet`, or sort before serializing, everywhere in state and
+> summaries alike.**
+>
+> This is why the merge laws above are checked on exact bytes: canonical encoding
+> is a platform requirement (freenet-core #5320), not a nicety. A contract that
+> merges correctly but encodes non-canonically will be reported as breaking
+> commutativity, and the conformance checker will tell you which of the two it is —
+> the finding says so explicitly when both results hold the same bytes in a
+> different order.
+
+> **Determinism matters in your `Summary` type too, for the same reason.** A
 > `HashMap` inside a `Summary` (or anything `summarize` returns) serializes in
 > nondeterministic order, so two identical states can produce different summary
 > bytes. Core compares summaries byte-for-byte to decide whether two peers have
@@ -412,9 +429,13 @@ mod tests {
 ### 1. Set-Based Operations
 
 ```rust
-// Members stored as a set - adding/removing is commutative
+// Members stored as a set - adding/removing is commutative.
+// BTreeMap, not HashMap: state is compared byte-for-byte across peers, and a
+// HashMap serializes in insertion order, so two peers that received the same
+// members in a different order would encode the same set differently and never
+// converge.
 pub struct MembersV1 {
-    members: HashMap<VerifyingKey, SignedMember>,
+    members: BTreeMap<VerifyingKey, SignedMember>,
 }
 
 impl MembersV1 {
