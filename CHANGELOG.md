@@ -2,6 +2,51 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.23.0 (2026-08-17)
+
+> Updated 2026-08-18: the pointer contract is now LIVE. River published the
+> first two records (`river.room-contract`, `river.chat-delegate`), both
+> verified from the network and resolved through `resolve_app_pointer`. Adoption
+> is still thin — Atlas and Delta have records prepared but unpublished, and
+> everything else including ghostkeys has none — so the bundle-fetch fallback in
+> `building-on-other-apps.md` remains the right path for those apps.
+
+The skill covered how to survive *your own* re-keys and said nothing about
+surviving *someone else's*, which is the problem third-party integrators
+actually have.
+
+- **New `references/building-on-other-apps.md`** — the consumer side of
+  addressing. A backward probe searches backward from a key you already hold, so
+  it cannot help an integrator who is pinned to a key that has since moved;
+  neither can pinning a version of the author's crate, which pins you to their
+  view of the key as of their release. The answer is to resolve the author's
+  pointer at runtime. Covers the three things integrators get wrong (deriving
+  with the pointer's params instead of your own, not persisting the anti-rollback
+  floor — including after a withdrawal — and handling only the two `PointerOutcome`
+  arms that carry a record, which silently no-ops on the other five), and states
+  the scope boundary: the pointer solves **addressing only** and says nothing
+  about whether state or secrets under the old key survived.
+- **The resolver is published, and the skill said no resolver existed.**
+  `references/upgrade-and-migration.md` described the pointer contract as
+  "emerging, not yet consumable" with "no client resolver exists yet". A
+  resolver ships in `freenet-migrate` 0.6.0 (`freenet_migrate::pointer`), so
+  that text was out of date; corrected, with the author-side and consumer-side
+  halves cross-linked. Note this is a claim about the *resolver*, not about
+  adoption: pointer adoption is thin, so the new file and the SKILL.md callout
+  both say to expect the webapp-bundle fallback to be the working path for most
+  apps today.
+- **`delegate-patterns.md` → "Depending on Someone Else's Delegate"** now offers
+  the pointer as the principled mechanism alongside the existing webapp-bundle
+  fetch, and is explicit about what the bundle pattern does not give you: no
+  author signature over the answer, no rollback protection, no withdrawal signal.
+- **Skill description now names integration**, so the skill loads for "how do I
+  read another app's contract" and not only for building or upgrading your own.
+- **Version housekeeping:** `marketplace.json` was still at 1.20.0 while this
+  changelog had already published 1.21.0 and 1.22.0 — both landed directly on
+  main, and the version-bump workflow only triggers on `pull_request`, so it
+  never ran for them. Bumped straight to 1.23.0. The CI trigger gap is filed
+  separately; this entry only fixes the drift.
+
 ## 1.22.0 (2026-08-17)
 
 Canonical serialization was documented for summaries only, and the commutativity
