@@ -754,7 +754,10 @@ const { delegate_key_bytes, code_hash_bytes } =
 This works from inside a sandboxed webapp: the gateway serves bundle files with
 `Access-Control-Allow-Origin: *`, and the sandbox CSP permits `connect-src` to
 the gateway origin. (Verified from an opaque-origin frame — `localStorage`
-throws there, and the fetch still returns 200.)
+throws there, and the fetch still returns 200.) That `localStorage` throws is
+not a footnote: it is why a Freenet webapp's durable client state, migration
+markers included, has to live in the delegate's secret store. See
+`upgrade-and-migration.md`, property 2.
 
 Three rules that matter:
 
@@ -814,10 +817,31 @@ Delegates store secrets (signing keys, user data) keyed by delegate key. A new W
 
 ### How migration actually works: re-run the old delegate
 
-There is **no `ExportSecrets` request handler** — earlier versions of this doc
-described one, but River ships nothing of the kind. The real mechanism (River's,
-and Delta's) is a **backward probe that re-runs the old delegate's own WASM**;
-the old delegate needs no special export handler.
+There is **no `ExportSecrets` request in the stdlib wire protocol** and no
+node-level copy-forward (see "Delegate secret migration: no core mechanism, and
+why" below). The mechanism is a **backward probe that re-runs the old delegate's
+own WASM**: the successor addresses a message to the predecessor's key, the node
+loads and runs that old WASM, and whatever handler it shipped with answers.
+
+**"Whatever handler it shipped with" is the whole constraint, and it is easy to
+read past.** River's predecessors need no *special* export handler only because
+River's chat delegate already answered a general-purpose `GetRequest` /
+`ListRequest` over its own secret namespace, so the new generation can enumerate
+through the app's ordinary protocol. Note who is calling: the crate is sans-IO
+and the *app* owns both ends of the round-trip, so it is River's UI that
+addresses the predecessor's key while presenting `MessageOrigin::WebApp` — which
+is stable across a delegate re-key. Do not reach for `OriginPolicy::FromDelegate`
+by analogy; River's own `check_origin` rejects delegate-to-delegate calls
+outright. A delegate whose `handle_request` accepts only its
+app's typed requests — the common case — can answer only those, and no
+client-side change alters that, because the old WASM is already deployed. That
+is sometimes enough: if the typed protocol exposes every key you need and the
+key set is fixed, the successor's UI can send the predecessor's own requests to
+the old key and recover the lot. It is not enough the moment a key family is
+dynamic and unguessable, which is what an enumeration or export handler is for —
+and you cannot add one retroactively. Read
+"A delegate migration is forward-only" below **before** you plan a migration; it
+changes when you adopt, not just how.
 
 1. On startup the successor (new) delegate's UI walks a committed registry of
    every previous delegate key (see "Migration Entry Registry" below).
@@ -849,6 +873,101 @@ everything else.
 > entries were removed as unrecoverable — affected users had to rejoin via
 > invite. Migrate promptly (don't let a generation sit unmigrated across an
 > stdlib bump), and never assume an arbitrarily old WASM will still run.
+
+### A delegate migration is forward-only
+
+**Adopting `freenet-migrate` does not carry your app's existing delegate secrets
+forward. The successor *asks*; only a predecessor whose already-deployed WASM can
+answer will.** The crate ships that answer as `handle_export_request`, called
+from your delegate: it authorizes the caller's origin, enumerates the requested
+secret scope generically via `SecretStore::list_secrets`, and packages the result
+into an outbound `ApplicationMessage`. A predecessor built before you added it
+rejects the request, so the walk records `PredecessorMigration::Unresponsive`
+every time it runs. That record is not itself permanent — an unresponsive
+predecessor earns no marker and is re-walked on the next load, which is the
+correct behaviour. What is permanent is that the re-walk can never succeed, so
+those secrets are **unrecoverable**: delegate secrets
+are node-local (`secrets_dir/<delegate-key>/`, encrypted under the node's own
+KEK, never replicated), so there is no second copy to recover from, and nothing
+you write on the client reaches WASM that is already published.
+
+The consequence is a scheduling rule, not a coding one: **every release you ship
+without an export handler adds one more permanently unrecoverable generation.**
+The handler does nothing for anyone on the day it lands — its entire value is
+that the *next* re-key is survivable. So land it as early as you can, ideally
+long before you have any migration to do, and treat "we have nothing to migrate
+yet" as the argument for adopting sooner rather than a reason to defer. (Harvest
+adopted the crate at four already-deployed delegate generations. Those four are
+written off; generation five onwards is recoverable.)
+
+Two things the handler must get right, both of which the crate makes
+load-bearing at the call site:
+
+- **Fail closed on an unattested caller.** `OriginPolicy::authorize` rejects
+  `origin: None` — which the runtime supplies when it cannot attest who is
+  asking — under every policy *except* `OriginPolicy::Any`, which accepts it and
+  is documented as unsafe / local-testing only. Never ship `Any`. These are
+  private keys; guessing is not an option.
+- **Export by prefix unless the delegate genuinely serves one web app.** A
+  delegate's secret namespace is shared by every app using it and the host does
+  not slice it per origin, so a whole-scope export hands the requester
+  everything. The crate gates that behind
+  `SingleAppDelegateAck::i_certify_this_delegate_serves_a_single_web_app()`.
+  `ExportScope::Prefix` narrows what you hand over and stays correct if the
+  delegate later serves more than one app. It does not, however, buy you a
+  smaller enumeration: `export_scoped` calls `list_secrets(b"")` on every
+  export, prefix or not, because cap saturation is a whole-scope property — so a
+  prefix export is refused by the truncation check below on exactly the same
+  terms as a whole-scope one.
+
+Two residual limits no handler fixes, worth knowing before you rely on an
+export. The host caps key enumeration per scope (`HOST_ENUMERATION_CAP`, 4096)
+and truncates silently, so `handle_export_request` **refuses** with
+`MigrateError::TruncatedExport` rather than shipping a partial set and then
+sealing a marker over it. And secrets written before the host gained its
+key-enumeration registry (freenet-core#4355) are not returned by
+`list_secrets` until they are rewritten — undetectable from inside the delegate,
+so touch such keys before relying on a whole-scope export.
+
+### `Ok(vec![])` is a positive claim, and it seals permanently
+
+The forward-only case above is the *benign* one: a predecessor that cannot
+answer is classified `Unresponsive`, earns no marker, and is re-walked next
+load. The damaging case is the successor's own adapter answering on its behalf.
+
+`PredecessorSecretsIo::fetch_secrets` is three-valued in effect, and only two of
+the three are visible in the type. `Ok(pairs)` and `Ok(vec![])` both mean **"I
+asked, and this is what it has"** — an empty vector seals the predecessor with a
+`Done { had_data: false }` marker that is never revisited. Return it for a
+request that merely went *unanswered* and you have recorded a slow, throttled or
+temporarily unreachable predecessor as permanently empty, silently, with the
+migration report reading complete. The crate says so in unusually flat terms:
+
+> the cost of a wrong `Err` is one retry, the cost of a wrong `Ok(vec![])` is the
+> user's data
+
+(`freenet-migrate 0.6.0`, `src/delegate_migrate.rs:417-436`.)
+
+So **`Err` is the right answer for silence** — a timeout, a transport failure,
+an undecodable reply, an answered error. It is not an abort: the driver records
+`PredecessorMigration::Unresponsive`, the walk continues or stops per
+`SecretSelectionPolicy`, and `migrate_delegate_secrets` still returns a report.
+
+This is one instance of the general rule stated under `upgrade-and-migration.md`
+property 2 and applied to `ProbeAnswer` in `contract-patterns.md`: **silence and
+absence must stay distinguishable at the type level, because only one of them may
+seal.** Make the third value an explicit variant rather than an `Option` that
+collapses two of them, route "no usable answer" to retry, and do the reduction in
+a pure function so each arm can be mutated red in a test.
+
+A definitive answer is *necessary* to seal and not *sufficient*. The prior
+question is whether the predecessor store is genuinely frozen after the re-key —
+if anything can still write to a predecessor, a durable marker strands whatever
+arrives after it. River seals because its legacy delegates are frozen and
+overrides the crate's recommended semantics to do so safely
+(`delegate_migration.rs`, constraint 1: "a timeout is not an absence"); ghostkeys
+bans durable markers outright. Harvest's `migrate::probe_gate` is the same shape
+on the client side.
 
 ### Preconditions
 
@@ -917,6 +1036,12 @@ and `register_delegate_with_migration` (the `delegate_migrate` module) are the
 app-facing entry points, and River, Delta and ghostkeys all drive them on `main`
 at 0.5.0. Delegate secrets still have no core-level equivalent and never will;
 see the next section for the full history and current guidance.
+
+**Adopting them is not retroactive.** The walk can only recover from a
+predecessor whose deployed WASM answers — see "A delegate migration is
+forward-only" above. That is an argument for adopting the crate *before* you
+need it: the handler does nothing on the day it lands, and everything for the
+re-key after that.
 
 For the call-site swap itself in an app that already hand-rolls a sweep, see the
 `freenet-migrate-adoption` skill.

@@ -2,6 +2,152 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.35.0 (2026-09-04)
+
+Resolves the blocking review finding on 1.34.0's marker rule, and adds two
+pieces of doctrine that came out of the same app.
+
+- **Marker placement, corrected.** 1.34.0 said to keep a contract migration
+  marker in browser `localStorage`. That does not work in the environment this
+  skill targets: the gateway serves a webapp in an iframe whose `sandbox` omits
+  `allow-same-origin`, so the app frame has an opaque origin and
+  `localStorage` throws. It fails *safe* — unreadable reads as "not migrated",
+  so the walk repeats rather than being skipped — which is why the bug was
+  silent in a real app until the sandbox attribute was re-read. The delegate's
+  secret store is the only durable client store a Freenet webapp has, and
+  1.34.0's "never keep a contract marker in the delegate" is withdrawn.
+- **The real question is whether the marker travels with a delegate export**,
+  and it turns on what the marker *names*. A marker naming a predecessor
+  **delegate** must not travel — copying it forward forges migration state for
+  the successor (River). A marker naming a **contract** generation should
+  travel — a delegate re-key does not change that fact (Harvest puts its
+  markers inside the exported prefix deliberately). Written as a table with the
+  deciding question, plus ghostkeys' third case (no durable marker at all), and
+  the note that the crate's own `PRED_DONE_MARKER_KEY_PREFIX` markers are not a
+  substitute. `contract-patterns.md`'s delegate-KV recipe and
+  `delegate-patterns.md`'s opaque-origin note now agree with it and point at it.
+- **A delegate marker request takes an id, not a raw storage key.** The
+  delegate prepends its own namespace, so nothing the caller sends can name a
+  key outside it. The same secret store holds private keys, so a raw-key write
+  would let a migration note overwrite an RSA private key — a general hazard
+  for any delegate with a shared secret namespace.
+- **NEW: a parameter-struct change is itself a migration, and the lineage
+  cannot express it.** A contract's address is
+  `BLAKE3(code_hash ‖ parameter_bytes)`, but `ContractLineageEntry` carries only
+  a code hash and `predecessor_ids(params, lineage)` maps the *current* build's
+  parameter bytes over every entry. So editing a parameter struct orphans every
+  instance ever published, and the probe reports a clean "nothing to migrate"
+  with green tests, green CI and no runtime symptom. Remedy: a frozen
+  generation boundary and a frozen copy of the old struct, deriving each
+  predecessor under the encoding it was published with. Scoped to contracts —
+  `DelegateLineageEntry` stores the full `delegate_key` and the walk never
+  re-derives it, so the delegate registry does not have this hazard.
+- **Excluding a marker from an export is an explicit predicate, not a
+  placement.** River keeps its markers in the ordinary key space and filters
+  them on both the fetch and the import path, because a predecessor read by key
+  enumeration has no export prefix to hide behind. Also notes that markers
+  carried inside an export consume `HOST_ENUMERATION_CAP`, and restores the
+  "mint the ids as hex" instruction that the rewrite had reduced to "ASCII at
+  the boundary".
+- **Sealing needs a precondition the skill only stated in one of its two
+  homes.** A definitive answer is necessary and not sufficient: the prior
+  question is whether the predecessor store is genuinely frozen after the
+  re-key. Added beside the placement material and beside `fetch_secrets`.
+- **`SeedLocal` no longer appears in `contract-patterns.md`'s "may seal"
+  list.** It contradicted a paragraph twelve lines above it in the same file,
+  and the `freenet-app-migration` skill that owns the rule. `freenet-migrate`
+  0.6.0 settles it: *"`Outcome::SeedLocal` deliberately does not claim to be
+  sealable"* (`src/driver.rs:160`). Pre-existing since 1.33.0.
+- **`contract-patterns.md`'s registry description said contract rows carry
+  "the params bytes used to derive the key".** They do not, which is the whole
+  premise of the new parameter rule. Corrected, with the warning placed on the
+  backward-probe recipe itself rather than only in `upgrade-and-migration.md`.
+- **The parameter rule got two limits from the external review pass.** A
+  generation boundary only works while each historical encoding maps onto a
+  distinct code hash — `freenet-migrate-build` rejects a duplicate contract code
+  hash, so two parameter-only re-keys on byte-identical WASM cannot both be
+  rows; the general answer is an app-derived `(code_hash, params)` candidate
+  list. And *noticing* you need a row is silent on the delegate side too: a
+  parameters-only re-key leaves the WASM unchanged, so a code-hash-comparing
+  publish guard says "unchanged" and `validate()` cannot object to a row nobody
+  wrote. An earlier draft of this entry claimed the delegate side "fails the
+  build"; only the registry *format* differs, not the detection.
+- **NEW: `Ok(vec![])` is a positive claim and seals a predecessor
+  permanently.** An empty-success answer from `fetch_secrets` is
+  indistinguishable from "nothing was there" and writes a
+  `Done { had_data: false }` marker that is never revisited; the crate's own
+  words are "the cost of a wrong `Err` is one retry, the cost of a wrong
+  `Ok(vec![])` is the user's data". Placed beside the forward-only section,
+  with the generalisation: silence and absence must stay distinguishable at the
+  type level, because only one of them may seal.
+
+## 1.34.0 (2026-09-04)
+
+Seven corrections from actually adopting `freenet-migrate` in a live app
+(Harvest, `feat/bitcoin-payments`). These are field findings, not review
+speculation — each one is something the skill as written would have led an
+engineer into.
+
+- **A delegate migration is FORWARD-ONLY, and that changes when you adopt.**
+  `delegate-patterns.md` read as though adopting the crate carries an app's
+  existing delegate secrets forward. It does not: the successor *asks*, and only
+  a predecessor whose already-deployed WASM can answer will. New section, "A
+  delegate migration is forward-only", because this is a scheduling decision
+  before it is a coding one: **every release shipped without an export handler
+  adds one permanently unrecoverable generation**, which makes "we have no
+  migration to do yet" the argument for adopting sooner rather than a reason to
+  defer. Covers `handle_export_request`, fail-closed origin policy, prefix vs.
+  whole-scope export, and the two residual limits (`HOST_ENUMERATION_CAP`
+  truncation refusal, pre-registry keys). Cross-linked from
+  `upgrade-and-migration.md` step 4.
+- **"There is no export handler" was stale and read as a general claim.** True
+  of the stdlib wire protocol; false of `freenet-migrate`, which has shipped
+  `handle_export_request` since 0.3.0. Corrected in all three places it appeared
+  (`SKILL.md`, `delegate-patterns.md`, `upgrade-and-migration.md`). River's
+  predecessors need no *special* handler only because its chat delegate already
+  answered a general-purpose `GetRequest`/`ListRequest` over its own secret
+  namespace — which most delegates do not. Note the caller is the app, not the
+  successor delegate: River's `check_origin` rejects delegate-to-delegate calls
+  outright, and the UI bridges the two generations under a stable WebApp
+  origin.
+- **Registry placement gets the constraint that actually forbids the wrong
+  choice.** "Placement follows who probes" (added in 1.33.0) is right, but does
+  not rule anything out on its own. Added the invariant that does: **a one-line
+  registry edit must not change the contract WASM bytes**, or the registry
+  causes the migration it exists to record. Two shapes satisfy it — the registry
+  outside the contract build graph (Harvest: `harvest-common` compiles into all
+  three contracts and the delegate, `harvest-ui` into none), or inside it but
+  `#[cfg]`-gated off the contract builds (River's `river-core`, which an outside
+  integrator needs). Verify with a WASM hash check, not `cargo tree`, which
+  reports crate edges rather than whether bytes moved.
+- **`ProbeDriver`, not `migrate_contract`, in shared-handler environments.**
+  `migrate_contract` needs awaitable request/response correlation; a browser
+  app on stdlib's Rust `WebApi` has none, because it delivers every response to a single
+  app-registered handler. `contract-patterns.md` now says which entry point
+  suits which environment and gives the hand-pump sequence.
+- **A guard that provably cannot fail needs a source-scrape pin, not a
+  behavioural test.** "Verify by mutation" has no answer for a wildcard arm over
+  a `#[non_exhaustive]` enum: while every variant is named, the arm is
+  unreachable, so inverting it to the unsafe default leaves the suite green
+  (Harvest's `seal_decision`). The remedy is a source pin kept *alongside* the
+  behavioural test — otherwise the general warning about source pins gets
+  applied to the one case where a source pin is correct.
+- **Never put a contract migration marker in the delegate.**
+  **(SUPERSEDED in 1.35.0 — this rule was wrong. `localStorage` throws at
+  the opaque origin a published webapp runs at; the delegate's secret store
+  is the right home. See the 1.35.0 entry.)** It is the obvious
+  home and it is wrong: the marker is lost when the *delegate* re-keys, which
+  silently resets every contract marker at exactly the moment the contracts
+  re-keyed too. Browser `localStorage`, hex-encoded, keyed by artifact +
+  instance + current code hash; unreadable storage must report "not migrated"
+  so the probe repeats.
+- **`DEFAULT_CIPHER`/`DEFAULT_NONCE` is not the only stdlib break on the way to
+  current.** `ContractInstanceId::from_bytes` is deprecated in favour of
+  `from_base58` as of **0.8.5** (it does not exist in 0.8.2–0.8.4), which fails a
+  build under `-D warnings`. Also notes what the rename reveals:
+  it parses base58 *text*, so code passing it a raw 32-byte id was already
+  wrong and wants `ContractInstanceId::new`.
+
 ## 1.33.1 (2026-09-04)
 
 `ui-patterns.md` told you to derive the WebSocket URL and, 30 lines earlier,

@@ -709,7 +709,10 @@ contract, or the merge won't converge, and migration silently fails.
 The mechanism River (freenet/river#292) and Delta actually ship — and the one to
 build by default — is a **backward probe from a committed registry of past code
 hashes**. For each predecessor generation you reconstruct its key from
-`BLAKE3(BLAKE3(old_wasm) || stable_params)`, GET the old state, fold it forward,
+`BLAKE3(BLAKE3(old_wasm) || params)` — where `params` must be the bytes **that
+generation was published under**, which is not automatically today's encoding;
+see `upgrade-and-migration.md` → "A parameter-struct change is a migration too".
+GET the old state, fold it forward,
 and re-PUT it under the current key (the successor's `validate_state` re-verifies
 every byte, so any client may do it — the owner need not be online). The registry
 is a committed TOML walked newest→oldest; this is written up in full under "the
@@ -761,9 +764,21 @@ old contract's state and follow it.
 ### Register old WASM hashes in a migration file
 
 Maintain a file like `legacy_contracts.toml` (analogous to
-`legacy_delegates.toml` for delegates) listing every historical contract WASM hash
-plus the params bytes used to derive its key. The `build.rs` generates a Rust
-`const` array from it; the runtime probes each old key at startup.
+`legacy_delegates.toml` for delegates) listing every historical contract WASM
+hash. The `build.rs` generates a Rust `const` array from it; the runtime probes
+each old key at startup.
+
+**A contract row records the code hash and nothing else** — `freenet-migrate`'s
+`ContractLineageEntry` is `{ generation, code_hash, note }`, and
+`predecessor_ids(params, lineage)` maps *one* set of parameter bytes over every
+row. So the registry cannot express a parameter change, and a parameter edit
+orphans every published instance while the probe reports a clean "nothing to
+migrate". If your parameters have ever changed shape, you must derive each
+generation under its own encoding yourself — see `upgrade-and-migration.md` → "A
+parameter-struct change is a migration too". (The delegate rows do not have this
+problem: `DelegateLineageEntry` stores the full `delegate_key`, the walk never
+re-derives it, and the registry row carries an optional `params_hex` that the
+build-time cross-check honours.)
 
 **Placement follows whoever runs the sweep. Ask "who probes?", not "where do
 registries go?"** Put the registry in whatever crate the probing code is built from.
@@ -784,6 +799,38 @@ apps are granted `{ReadPublic, Sign}` and never `Export`
 (`delegates/ghostkey-delegate/src/permissions.rs:99`), so shipping them the registry
 would hand them a table they are incapable of using. `ghostkey-common 0.3.0` therefore
 ships no registry, and that is correct rather than a gap.
+
+**"Who probes?" orients the choice; this invariant constrains it. A one-line
+registry edit must not change the contract WASM bytes.** Otherwise recording a
+migration re-keys the very contracts the registry describes, and you have built
+a registry that *causes* the migration it exists to record. The hazard is real
+and easy to walk into, because the registry's natural home — the shared "common"
+crate — is usually the one that compiles into the contracts.
+
+Two shapes satisfy the invariant, and which one you want depends on who needs
+the table:
+
+- **Registry in a crate outside the contract build graph.** Simplest, and right
+  when only your own UI probes. In the Harvest marketplace `harvest-common`
+  compiles into all three contracts and the delegate while `harvest-ui` compiles
+  into none, so the codegen lives in `harvest-ui/build.rs` even though both are
+  shared crates. Decide from the dependency direction, not from which crate is
+  named "common".
+- **Registry inside the graph, but `#[cfg]`-gated off the contract builds.**
+  Right when an outside integrator builds against the crate and needs the table
+  (the case above, where placement and the invariant pull apart). River does
+  this: `river-core` code-generates `legacy_room_contracts.rs` from the
+  checked-in `legacy_room_contracts.toml`, and the
+  room-contract depends on `river-core`, but the generated module sits behind
+  `#[cfg(feature = "migration")]`, which the contract and delegate WASM builds
+  do not enable — so the registry is reachable from crates.io and `riverctl`
+  while the contract bytes never see it.
+
+**Verify it, don't infer it.** `cargo tree --invert` tells you crate edges, not
+whether bytes moved, and it would wrongly condemn River's arrangement. The test
+is the artifact: edit the registry, rebuild, and `b3sum` the contract and
+delegate WASM against the pre-edit hashes. That is the property you actually
+need, and it is the same pre-publish hash check the next section describes.
 
 ### Pre-publish check
 
@@ -819,7 +866,12 @@ The recipe:
 2. **Record per-identity which contract hash that user's state lives
    under**, on the *delegate* (not on-chain) — e.g. an
    `AliasInfo { inbox_wasm_hash: Option<String>, … }` on the identity
-   delegate, persisted client-side.
+   delegate, persisted client-side. The delegate is the right home and the
+   only durable one: a published webapp runs at an opaque origin where
+   `localStorage` throws. Two placement rules come with it — whether the
+   marker travels with a delegate export, and never letting the client
+   choose the raw storage key. Both are in `upgrade-and-migration.md`,
+   property 2; read them before adding a marker.
 3. **Maintain an append-only `LEGACY_*_CODE_HASHES` slice**, ordered
    oldest → newest, listing every prior `INBOX_CODE_HASH` the project
    has shipped.
@@ -836,7 +888,9 @@ The recipe:
    on the delegate BEFORE dispatching GETs; clear it only when the PUT
    under the current key succeeds. If the session ends before any GET
    resolves (offline, browser crash, gateway hiccup), the next session
-   sees the marker and re-attempts.
+   sees the marker and re-attempts. This marker names a **contract**
+   generation, so it is one that should be carried forward on a delegate
+   export — see the placement table in `upgrade-and-migration.md`.
 7. **Backwards-compat the delegate state** so old UI versions can read
    the new fields: every new field on `AliasInfo` is
    `#[serde(default)]`.
@@ -884,7 +938,7 @@ copy:
 |---|---|---|
 | Who triggers the migration | Any updated client; owner also writes pointer | The state's signer, in their own UI |
 | Where the legacy list lives | Embedded in WASM (read via build.rs from `legacy_contracts.toml`) | A Rust `const &[&str]` slice in the UI |
-| Recovery if a hop fails mid-flight | Pointer is permanent on-chain | `pending_migration_from` marker on delegate |
+| Recovery if a hop fails mid-flight | Pointer is permanent on-chain | `pending_migration_from` marker in the delegate's secret store |
 | Works for per-user state with no shared owner | Pointer half doesn't apply; probe half does | Yes |
 | Works for shared-room / single-owner state | Yes | Yes (probe needs no owner) |
 
@@ -928,6 +982,34 @@ generation field, first real state wins, an undecodable or placeholder response 
 a miss and advances the walk, late responses are single-shot ignored, and a hop cap
 bounds the walk.
 
+**Which entry point you use is an environment question, and a browser app needs
+the driver.** `migrate_contract` is a thin async wrapper that awaits a
+`ProbeIo::get` per candidate — right for a CLI, a bridge, a test harness, or
+anything with awaitable request/response correlation. A Rust browser app on
+stdlib's `WebApi` has none: it delivers every response to a single
+app-registered handler, so a request and its answer are not connected by
+anything the language can await, and correlation is the app's job. (A TS UI is not simply
+exempt. The TypeScript `FreenetWsApi` returns a promise per request, but it
+correlates by **FIFO queue position, not contract id** — `resolveNext` is a
+`queue.shift()` (`websocket-interface.ts:899-905`) — so it is only correct with
+one GET outstanding. And it **rejects** on `NotFound`
+(`new Error("Contract not found")`, `:769`) exactly as it rejects on a deadline
+(`new Error("Request timeout")`, `:890`), so `Absent` and `Unknown` arrive in the
+same shape, separable only by matching an error string. The idiomatic
+`try { await get() } catch { /* nothing there */ }` is the data-loss default the
+next section forbids. A TS app must rebuild that distinction itself before it can
+decide anything — and `migrate_contract` is a Rust crate function with no
+JavaScript binding, so it writes the loop either way.) There, construct
+`ProbeDriver` directly and pump it
+by hand: `next_action()` → send the GET and arm a timeout → feed the result back
+through `on_response` / `on_absent` / `on_unknown` (an expired timer is
+`on_unknown`) → `take_outcome()` at `Step::Done`. The crate documents this on
+`migrate_contract` itself, and the two make identical decisions by construction —
+the wrapper is a loop over the same machine. Hand-pumping earns its keep even
+where a wrapper would compile: it puts the sequencing in code `cargo test` runs
+on the host, leaving only "send a GET, arm a timer, route a response" behind the
+wasm gate.
+
 **Silence is not absence.** This is the 0.6.0 break (freenet-migrate#19), and it is
 the whole reason to be on 0.6.0. Your adapter's `ProbeIo::get` returns a three-way
 `ProbeAnswer`: `State(bytes)`; `Absent` for the node's real
@@ -966,9 +1048,15 @@ write.
 "protects exhaustive matches only"), so **a wildcard arm that defaults to "done"
 writes a permanent marker wrongly** — for today's non-definitive variants and for
 every variant added later. May seal: `Recovered` with no unresolved candidates and
-no truncated fold; `SeedLocal`. Must NOT seal: `Indeterminate`, `Recovered` with
-unresolved candidates or a truncated fold, any error, and any variant the `match`
-did not name. Name the sealing variants explicitly and let the wildcard fall
+no truncated fold — that is the one *positive* result, where you found the data
+and know the search was complete. Must NOT seal: `Indeterminate`, `Recovered`
+with unresolved candidates or a truncated fold, any error, and any variant the
+`match` did not name. **`SeedLocal` must not seal either**, however conclusive an
+all-`Absent` walk looks. The crate says so itself: *"`Outcome::SeedLocal`
+deliberately does not claim to be sealable"*
+(`freenet-migrate-0.6.0/src/driver.rs:160`), because `Absent` is unauthenticated
+— see the paragraph above. Seeding your local snapshot forward on `SeedLocal` is
+still fine; that is not the same act as sealing. Name the sealing variants explicitly and let the wildcard fall
 through to "retry next run".
 
 **Probe unconditionally per `(instance, current_code_hash)`, before anything writes

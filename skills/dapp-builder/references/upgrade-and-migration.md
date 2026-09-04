@@ -125,9 +125,16 @@ The whole procedure, start to finish:
    `freenet-migrate` ships the delegate-side entry points
    (`migrate_delegate_secrets`, `register_delegate_with_migration`, unchanged
    since 0.5.0), and River, Delta and ghostkeys all drive them on `main` at
-   0.5.0. See `delegate-patterns.md` →
-   "Delegate secret migration: no core mechanism, and why" for the full history
-   and current guidance, and `contract-patterns.md` for the contract-side
+   0.5.0. **A delegate migration is forward-only**: the successor asks, and only
+   a predecessor whose already-deployed WASM answers (in practice, one that
+   shipped `handle_export_request`, or an app protocol general enough to
+   enumerate its own secret namespace) can be recovered from. Every release
+   shipped without that handler adds one permanently unrecoverable generation,
+   which makes "we have no migration to do yet" the argument for adopting
+   sooner, not later. See `delegate-patterns.md` → "A delegate migration is
+   forward-only" for what the handler must get right and the limits no handler
+   fixes, and → "Delegate secret migration: no core mechanism, and why" for the
+   full history. See `contract-patterns.md` for the contract-side
    mechanics. For the procedure of swapping an existing hand-rolled sweep over
    to the crate, see the `freenet-migrate-adoption` skill.
 
@@ -180,12 +187,112 @@ first-class upgrade path, not a loophole:
 - **This whole document is about the other case** — your data contracts and
   delegates, where the WASM itself changes and state has to be carried forward.
 
-Everything below applies to the WASM-change case.
+Everything below applies to the case where the artifact's **address moves**:
+a WASM change, or the parameter change covered just below.
 
 Therefore **the entire risk surface of an upgrade is the migration.** Don't aim
 for "risk-free upgrades" (impossible); aim for migrations that are *idempotent,
 resumable, non-destructive, regression-gated, and observable*. The five
 properties below are the whole game.
+
+### A parameter-struct change is a migration too, and the lineage cannot express it
+
+The formula at the top of this section has two halves, and only one of them is
+about WASM. `BLAKE3(code_hash || params)` means **editing a contract's parameter
+struct re-keys every instance exactly as surely as editing the WASM does** —
+even when the WASM is byte-identical. That half of the formula is easy to forget
+because a parameter struct looks like an ordinary type.
+
+The trap is that `freenet-migrate` cannot notice.
+`ContractLineageEntry { generation, code_hash, note }` records **no parameter
+bytes**, and `contract::predecessor_ids(params, lineage)` maps *one* `params`
+— the current build's — over every entry. So after a parameter edit the probe
+walks a list of addresses that never existed, takes `NotFound` at each, and
+reports a clean "nothing to migrate". **Green tests, green CI, no runtime
+symptom, and every instance ever published is orphaned.** Harvest came within
+one commit of shipping that: removing two fields took `StoreParameters` from 109
+CBOR bytes to 56, which would have silently written off five generations of a
+seller's entire store.
+
+The remedy is to freeze a **generation boundary** and derive each predecessor
+under the encoding it was actually published with:
+
+```rust
+/// Generations at or below this were published under the OLD parameter shape.
+/// A fixed historical fact, not a thing to bump on the next re-key.
+pub const LAST_LEGACY_STORE_PARAM_GENERATION: u32 = 5;
+
+// A frozen copy of the old struct, written out rather than derived from the
+// live type -- deriving it from a type still being edited is how it goes
+// quietly wrong a second time.
+#[derive(serde::Serialize)]
+struct LegacyStoreParameters { /* ...the fields as they were, with the values
+                                  the publishing code actually supplied... */ }
+
+let mut by_generation: Vec<(u32, ContractInstanceId)> = lineage
+    .iter()
+    .map(|e| {
+        let params = if e.generation <= LAST_LEGACY_STORE_PARAM_GENERATION {
+            &legacy
+        } else {
+            &current
+        };
+        (e.generation, contract_id_from_code_hash(&e.code_hash, params))
+    })
+    .collect();
+// Newest-first, by the registry's DECLARED generation and never by slice
+// order. `NewestFirst::from_lineage` does this for you; a hand-derived list
+// handed to `assume_ordered` must do it itself, or a generation appended out
+// of order silently loses the anti-rollback guarantee.
+by_generation.sort_by_key(|(generation, _)| core::cmp::Reverse(*generation));
+```
+
+Harvest's `ui/src/migrate.rs` (`store_candidate_ids`,
+`legacy_store_params_cbor`) and `legacy/README.md` are the worked shape,
+including a test that pins the boundary.
+
+**A generation boundary only works while each historical encoding maps onto a
+distinct code hash.** If the *same* WASM was ever published under two parameter
+shapes, the registry cannot even hold both rows —
+`freenet-migrate-build`'s `validate()` rejects a duplicate contract code hash
+(`BuildError::DuplicateCodeHash`) — and the branch above picks one encoding per
+row regardless, so one historical address is never probed. The general answer is
+to keep the historical `(code_hash, parameter_bytes)` **pairs** and derive a
+candidate id from each, rather than a boundary over a code-hash-only lineage.
+The crate supports it: `NewestFirst::assume_ordered` takes a candidate list the
+app derived itself, which `ProbeDriver::new` accepts in place of
+`NewestFirst::from_lineage`. (Harvest wraps that as its own
+`ProbeSession::start_with_candidates`; the crate has no such constructor.) A
+boundary constant is the simple case of deriving your own candidates, not a
+substitute for it.
+
+**The *registry-format* half of this is contract-side specifically.** The
+delegate registry can say what the contract registry cannot: `DelegateLineageEntry` stores the full `delegate_key` per row and the
+walk uses it verbatim, never re-deriving it (`delegate_migrate.rs:1547`), and
+the registry row carries an optional `params_hex` that the build-time
+cross-check honours. So the delegate registry *format* can express a parameter
+change, where the contract format cannot express one at all.
+
+**Noticing that you need a row is silent on both sides, though**, and this is
+the part to guard yourself. A parameters-only re-key leaves the WASM
+byte-identical, so a pre-publish check that compares code hashes reports
+"unchanged" and you never append a row — and `Registry::validate()` only
+cross-checks the rows that are *present*, so it cannot object to the row you
+did not write. Make your publish guard compare the **derived address**
+— `blake3(code_hash ‖ params)`, the thing that actually moved — rather than the
+code hash alone, or a parameters-only re-key ships with green CI on both sides.
+
+Practical rules:
+
+- **Treat a parameter-struct edit as a re-key event** and put it through the same
+  procedure as a WASM change: record the outgoing generation before rebuilding.
+- **Prefer moving the field elsewhere.** Parameters are the address; state is
+  not. Harvest's two fields moved onto `Order` (state) rather than staying in
+  parameters, which is the change that caused this. A state field can then be
+  *extended* without re-keying anything — subject to architecture invariant 2
+  below, which still forbids removing, renaming or repurposing one.
+- **Say where the boundary falls in the registry file itself**, next to the rows
+  it splits, so the next person appending a row sees it.
 
 ## Architecture invariants (decide these before v1 — you cannot bolt them on)
 
@@ -227,8 +334,9 @@ properties below are the whole game.
 
    ```rust
    // On migration start (before the first per-entity write):
-   set_flag("migration_in_progress");      // a localStorage / delegate key,
-                                           // namespaced per source-version set
+   set_flag("migration_in_progress");      // in the DELEGATE's secret store --
+                                           // see below; namespaced per
+                                           // source-version set
    // ... write each entity via CAS ...
    // ONLY after every entity is written:
    clear_flag("migration_in_progress");
@@ -249,6 +357,97 @@ properties below are the whole game.
    definitive probe outcome. Never seal it because the destination *looks*
    populated: that is the empty-destination gate in disguise, and any earlier
    write then makes the migration permanently unreachable.
+
+   **A published Freenet webapp has no browser storage, so the marker belongs in
+   the delegate's secret store.** The gateway serves a webapp in an iframe whose
+   `sandbox` attribute omits `allow-same-origin`
+   (`freenet-core:crates/core/src/server/path_handlers/assets/shell.html`), so the
+   app frame has an opaque origin and `window.localStorage` throws. A marker kept
+   there works under `dx serve` and is a silent no-op the moment it is published.
+   It is silent because it fails in the *safe* direction — unreadable reads as
+   "not migrated", so the walk repeats forever instead of being skipped — which
+   is exactly why nothing reports it. Harvest shipped that and found it only by
+   re-reading the sandbox attribute. (The *shell* is same-origin with the node and
+   does have storage, but that is the node's origin, shared by every app on it,
+   and your app frame cannot reach it — `path_handlers.rs:1672-1676`.)
+
+   For a **browser** app the delegate's KV store is therefore the only durable
+   client-local store left. (A non-browser client has its own filesystem and
+   should use it — the freenet-bitcoin bridge keeps its markers in SQLite,
+   `bridge/src/store.rs:145`. A per-user contract keyed on the user's own
+   verifying key is also durable and survives a delegate re-key, at the cost of a
+   network round trip on every page load.)
+
+   Keeping a *contract* marker in the delegate costs one extra probe when the
+   **delegate** re-keys. That is not the defect it looks like **provided your fold
+   only ever adds** — check that it does, because a fold that can overwrite makes
+   the re-probe a regression rather than waste — and a delegate re-key is the
+   moment your secrets moved too, so re-probing then is the honest answer.
+
+   **Before making it durable at all, ask whether the predecessor store is
+   genuinely frozen after the re-key.** A durable marker is what makes a wrong
+   "nothing there" verdict permanent, so it is only safe when nothing can write
+   to a predecessor after you have declared it done. River's legacy delegates are
+   frozen — only the current delegate is ever written — so it seals. ghostkeys
+   **bans** durable markers for the opposite reason: a contrast test showed one
+   there resurrects a data-loss scenario verbatim. Decide per app, write down
+   which way and why, and never port one app's answer to another.
+
+   **If you do make it durable, the next question is whether it must be kept out
+   of a delegate export.** The store has to outlive every artifact whose
+   migration the marker records, *and* the marker must not survive into a context
+   where its claim has stopped being true. Those pull in opposite directions, and
+   which wins depends on what the marker names:
+
+   | The marker names… | Keep it out of the export? | Why |
+   |---|---|---|
+   | a predecessor **delegate** (River) | **Yes** | When the current delegate later becomes a predecessor itself, its store holds these keys; copying them forward asserts the successor already imported that predecessor. It has not — the marker would forge migration state. |
+   | a **contract** generation (Harvest) | **No** — put it inside the exported prefix on purpose | "Store contract X's predecessors were folded into it" is a fact about contracts. A delegate re-key does not change it, so carrying it forward is accurate and saves the re-probe above. |
+
+   River and Harvest made opposite choices here and both are right; copy the
+   reasoning, never the choice.
+
+   **Excluding a marker is an explicit predicate, not just a placement.** River
+   keeps its markers in the *ordinary* key space and filters them by prefix on
+   **both** sides — the fetch path (`candidate_keys`) and the import path
+   (`classify_recovered`), via `is_migration_marker_key` — precisely because a
+   predecessor read by key enumeration has no prefix boundary to hide behind.
+   Placing the marker outside an `ExportScope::Prefix` is a cheap extra guard when
+   your export is prefix-scoped; it is not sufficient on its own. The crate's own
+   `PRED_DONE_MARKER_KEY_PREFIX` markers are not a third option here: they seal
+   *delegate* predecessors, live under a `\0`-prefixed reserved namespace, and
+   the driver strips them from exports — but it strips only its own namespace, so
+   app-chosen markers stay the app's problem.
+
+   Markers carried inside an export also **consume the export's enumeration
+   budget**: `export_scoped` enumerates the whole scope regardless of prefix and
+   refuses at `HOST_ENUMERATION_CAP` (4096). Keep the marker key space bounded by
+   `(artifact, instance, code_hash)` rather than letting it grow per attempt.
+
+   **The client must not supply a raw storage key.** Take a marker *id* and
+   prepend the namespace inside the delegate (`harvest:migrate:` ++ id). The same
+   secret store holds private keys, so a request that accepted a raw key would let
+   a migration note overwrite `harvest:rsa_sk:*` — a general hazard for any
+   delegate whose secret namespace is shared. Harvest pins it with a test that
+   sends the marker id `"harvest:rsa_sk:fp1"` and asserts the private key survives
+   (`delegates/harvest-delegate/src/markers.rs`).
+
+   **Key it by `(artifact, instance, current_code_hash)`, mint the ids as hex, and
+   require ASCII at the delegate boundary.** Raw bytes in a storage key alias under
+   any lossy UTF-8 conversion: River's chat delegate builds its key with
+   `String::from_utf8_lossy` (`delegates/chat-delegate/src/utils.rs:9`), which maps
+   every invalid byte to U+FFFD, so two distinct 32-byte ids collapse onto one
+   marker slot and one gets sealed having never been migrated. Enforcing ASCII in
+   the delegate makes that a property of the store rather than a habit of today's
+   caller.
+
+   **An unreadable store, a refused write and a malformed id all report "not
+   migrated."** The probe then repeats, which is wasteful and safe; reading any of
+   them as "already done" skips the migration entirely. Harvest's
+   `ui/src/migrate.rs` (`probe_gate`, a pure function over a three-valued
+   `MarkerLookup` so silence is distinguishable from a definite absence at the
+   type level) and `delegates/harvest-delegate/src/markers.rs` are the worked
+   shape.
 
 3. **Non-destructive.** Never delete the source until the destination is
    confirmed complete. Keep the old blob/keys as a rollback fallback so an old or
@@ -335,6 +534,21 @@ this pattern; its earlier source-pin-only test had a false positive (it passed
 even with the recovery call deleted), so prefer a pure-function behavioral test
 and verify by mutation that removing the fix fails the test.
 
+**When a guard provably cannot fail, a source-scrape pin is the right tool —
+and the only one.** Mutation testing asks you to name an input that turns the
+test red; some guards have none, and they are exactly the guards worth keeping.
+The canonical shape is the wildcard arm of a `match` over a `#[non_exhaustive]`
+enum: while every variant defined today is named explicitly, the wildcard is
+unreachable, so inverting it to the unsafe default leaves every behavioural test
+green. It is protecting against a variant a *future* release adds, which no input
+you can construct today reaches. Harvest hit this in `seal_decision`: inverting
+`_ => Seal::Retry` to `Seal::Seal` broke nothing. The remedy is not a better
+behavioural test — it is a test that reads the source and asserts the arm exists
+and returns the safe value, kept **alongside** the behavioural test rather than
+instead of it, with a comment saying why this one guard is pinned that way.
+Otherwise the earlier rule (a source pin is a false positive waiting to happen)
+gets applied to the one case where it is correct, and the pin is deleted.
+
 **Three questions worth asking of any migration change in review.** Each names a
 failure a green test suite let through.
 
@@ -396,7 +610,9 @@ failure a green test suite let through.
   the optional in-state `OptionalUpgrade` straggler pointer, and the preconditions.
 - `references/delegate-patterns.md` — delegate migration mechanics: the backward
   probe that re-runs the old delegate's WASM via `DelegateRequest::ApplicationMessages`
-  (there is **no `ExportSecrets` handler**), `legacy_delegates.toml`, the fragility
+  (there is **no `ExportSecrets` request in the stdlib wire protocol**, so the
+  predecessor answers with whatever handler it shipped with — see "A delegate
+  migration is forward-only" there), `legacy_delegates.toml`, the fragility
   when an stdlib/ABI bump strands old WASM, and the double-hashing bug.
 - `references/build-system.md` — byte-reproducibility (commit `Cargo.lock`, pin the
   toolchain, build `--locked`; and the `wasm-opt`/`dx`/path-embedding and
@@ -418,6 +634,12 @@ failure a green test suite let through.
 - The `freenet-migrate-adoption` skill: the procedure for swapping an app's
   existing hand-rolled sweep over to the crate (call-site swap, dual-running,
   the parity test, what rollback cannot undo).
+- **Harvest citations point at a repository that is not public yet.** Several
+  rules here name `harvest-bitcoin` paths (`ui/src/migrate.rs`,
+  `delegates/harvest-delegate/src/markers.rs`, `legacy/README.md`) because that
+  is where they were found and pinned. The reasoning and the code sketches are
+  reproduced inline so nothing here depends on reading it; treat the paths as
+  provenance rather than a link to follow.
 - River as worked reference: freenet/river#345 (per-entity CAS keys), #352
   (resumable/interrupted-migration recovery), #253 (regression-gated legacy probe),
   #204 (old delegate WASM unrunnable after an stdlib bump), #393 (gitignored
