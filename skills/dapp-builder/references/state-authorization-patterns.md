@@ -310,6 +310,31 @@ Host fetches the requested contracts (locally first, then network) and re-invoke
 
 The related-contracts mechanism shipped in freenet-core PR #3650 (March 2026). Comprehensive unit-test suite. Plan for surprises — discovering edge cases in production is what first-users do. Add an explicit local-node smoke test (`e2e-test/`-style) before declaring your dApp production-ready, and consider feature-flagging the dependent UI flow until you've seen the mechanism work in real network conditions.
 
+### Never Gate an Item's Validity on a Value That Can Decrease
+
+`validate_state` must reach the same verdict on the same bytes forever. That is
+automatic for a check confined to the bytes in front of it — `balance >= 0`, "every
+entry carries a valid signature", "the counter never goes backwards" are all fine,
+and a balance being *spendable* does not make it unusable as a well-formedness
+check. The hazard is narrower and easy to miss: **an already-accepted item whose
+validity depends on a quantity that can later shrink.** Two shapes do it.
+
+1. **A value read live from another contract** (the `RelatedContracts` mechanism
+   above). A listing gated on the seller's reputation "standing" is accepted at
+   standing 80 and rejected once complaints drive standing to 40 — the listing's
+   own bytes never changed. Peers that validate at different times reach different
+   verdicts, permanently, and no merge reconciles them.
+2. **A mutable aggregate elsewhere in the same state.** "This entry is valid
+   because `total_stake >= X`" has the same defect if a later merge can reduce
+   `total_stake`: the entry was valid when merged and is not any more.
+
+The fix in both cases is to move the shrinking quantity out of the validity rule,
+not to bound it. Compute standing in *readers* — the UI ranks, filters or warns on
+it — and leave the contract's validity rule to signatures and monotonic facts. If
+the check must be in the contract, bind it at write time to something immutable:
+have the reputation contract's owner sign a "standing was >= 50 on <nonce>"
+attestation and validate *that signature*, which stays true forever.
+
 ## Wire-Format Stability
 
 ### Forever-Compat Once Shipped
@@ -347,6 +372,29 @@ pub struct InboxMessage {
 
 These fields must be required; a state lacking them should fail to decode.
 
+### Never Ship a State Version That Skips Verification
+
+Same class as the above, one step more severe. A defaulted auth field weakens one
+check; a *version* whose decode path does not verify signatures removes the check
+entirely, and the version tag is attacker-chosen. Anything that can write the
+unverified version — a legacy `V0` kept "for old data", a `Draft` variant, an
+`Unsigned` shape used by a test fixture or a migration — bypasses verification for
+every field at once, because verification is now conditional on a byte the writer
+supplies.
+
+```rust
+// BAD: the writer picks the arm that verifies nothing.
+enum Item {
+    V0(UnsignedItem),   // "legacy, we'll drop it later"  <-- attacker's choice
+    V1(SignedItem),
+}
+```
+
+If old unsigned data genuinely exists, migrate it *behind* a verified wrapper — the
+migrating writer signs it, so the unverified shape never appears on the wire — and
+delete the variant. Never leave a decode path in which "which checks run" depends on
+untrusted input. A test asserting `V1` rejects tampering says nothing about `V0`.
+
 ## State Size Budget
 
 The host enforces `MAX_STATE_SIZE = 50 MiB` as a hard correctness backstop — a PUT/UPDATE that would exceed it is rejected outright. Plan caps so worst-case state fits with margin:
@@ -354,6 +402,15 @@ The host enforces `MAX_STATE_SIZE = 50 MiB` as a hard correctness backstop — a
 - Per-item cap × max-items + envelope overhead ≤ 50 MiB.
 - Including auth metadata (signatures are 64 bytes, VKs 32 bytes, etc.).
 - Including any tombstone/log structures.
+
+**A count cap is not a size bound.** `MAX_ITEMS = 1000` bounds nothing on its own if
+an item can be any size — the real bound is 1000 × *the largest item the other side
+may send*, and the other side chooses. A cap that reads like a memory limit and is not
+one is how a contract-controlled value becomes an out-of-memory. Whenever you write a
+count over variable-size values, multiply it by that worst case and check the product;
+better, budget the **bytes** directly (a running total enforced in `update_state`) and
+let the count fall out of it. The arithmetic below is exactly that multiplication —
+note that it is the per-item cap, not the count, that makes it come out finite.
 
 Example for the inbox: `MAX_INBOX_MESSAGES = 1000` × `MAX_CIPHERTEXT_BYTES = 32 KiB` = 32 MiB messages, plus ~140 bytes/message metadata = ~32.1 MiB, plus a few KB of recipient_state. Well under the 50 MiB cap — though, per the design target below, `MAX_INBOX_MESSAGES` is a candidate to tune down or to shard further (e.g. archiving older messages into per-time-window contracts) rather than a bound to treat as settled.
 
