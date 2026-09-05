@@ -32,9 +32,17 @@ one does not solve yours.
 > same 32 raw bytes, and it is those 32 bytes the resolver wants.
 >
 > Everything else, including ghostkeys, has no record — so for those your
-> resolve returns `NeverPublished` (a real "not found") or `Unavailable` (your
-> transport could not tell), and the baked-in fallback is legitimately what you
-> use. Worth noticing that ghostkeys — the app whose re-keys caused the breakage
+> resolve returns `NeverPublished` (a real "not found"), the one outcome that
+> *permits* a baked-in key. For these apps the **bundle fetch** at the end of this
+> file is still the better answer, and is what ghostkeys itself does; the
+> permission matters because it is what makes a fallback legitimate at all.
+> **`Unavailable` is not that case**: it means your transport could not tell, and
+> it never licenses the *baked-in* fallback, on an unpublished app or any other.
+> Retry instead. (An earlier version of this
+> paragraph named the two outcomes together, which contradicted both the outcome
+> table below and `may_use_baked_in_fallback`; treating "could not reach it" as
+> "it does not exist" is a free downgrade for anyone who can drop your GET.)
+> Worth noticing that ghostkeys — the app whose re-keys caused the breakage
 > this file exists to prevent — is still in that group, so the reader most likely
 > to reach for a pointer is the one it cannot yet help.
 >
@@ -85,7 +93,12 @@ which is what makes this work for a third party. The in-state `OptionalUpgrade`
 pointer in `contract-patterns.md` is a different thing: it is per-instance and
 only findable by a client that already holds a reference to *that* contract. The
 `FacadePointer` in `facade-pattern.md` is a third thing again: it moves an
-audience to a different contract, for the author's own users.
+audience to a different contract, for the author's own users. And
+`freenet_migrate::SuccessorPointer` is a fourth: an older, unrelated primitive
+in the same crate, signing under `freenet-migrate/successor-v1` where the
+pointer contract signs under `freenet-pointer/state-v1`, with a different
+message layout. A signature under one domain never verifies under the other, so
+they are not interchangeable and importing the wrong one compiles.
 
 Mechanics, wire format, and the operational requirements are in the contract's
 own README — do not restate them here, or the two copies drift:
@@ -175,6 +188,32 @@ leaves you pinned for the life of the session, and repeated resolving is the
 only thing that bounds how long an author's newer record can be suppressed from
 you. Subscribing to the pointer is a best-effort accelerant, not a substitute:
 subscriptions are dropped silently across reconnects.
+
+### The transport you hand it
+
+`resolve_app_pointer` drives a `PointerIo` you implement, and two properties of
+that implementation are load-bearing.
+
+**Its result type is three-way on purpose.** `PointerFetch` is `State` /
+`Absent` / `Unreachable`, and `Absent` means *you asked and were told no* —
+never a timeout, a send failure, or a malformed reply, all of which are
+`Unreachable`. Wire it as a two-way `Option` and you collapse those two, which
+means you can never reach `NeverPublished` and have silently deleted the only
+outcome that unlocks your fallback. This is the same mistake as `ProbeAnswer`'s
+on the backward side (freenet-migrate#19), in the same crate, for the same
+reason. An empty response body must never reach `Absent` either: those bytes came from a
+peer, and the contract rejects empty state as invalid. The crate enforces this
+itself — an empty `State(vec![])` is turned into `PointerOutcome::Unavailable`
+rather than `NeverPublished` — so the rule to keep is that only a real
+"not found" may ever be reported as `Absent`.
+
+**The GET must not request the contract code.** The 100-byte record is the whole
+answer; the pointer's own WASM is around 130 KB, and fetching it on every
+resolve is pure waste. This is the one reason `PointerIo` exists as its own
+trait rather than reusing `ProbeIo`, whose GET *does* request the code because a
+backward probe needs it. `ConservativeProbeIo` adapts a `ProbeIo` you already
+have and is fine for reusing plumbing, but it inherits that cost — implement
+`PointerIo` directly for anything that resolves often.
 
 ### Four things people get wrong
 
@@ -362,7 +401,28 @@ your own re-keys, and it costs one signed 100-byte record per release.
 - **The author key is a long-lived identity.** Keep it offline; it is not a
   per-release key and there is deliberately no delegated signing.
 - **Gate `version` on a single committed monotonic counter**, the way a
-  web-container version counter works — never a wall-clock timestamp.
+  web-container version counter works — never a wall-clock timestamp. The
+  contract's own docs give burning the version space as the reason ("an author
+  deriving `version` from a timestamp would land there", i.e. at the reserved
+  `u32::MAX`); a Unix *seconds* timestamp is only about 42% of `u32::MAX` today,
+  so the immediate harm is less that you hit the ceiling than that you can never
+  go back down and have thrown away most of the range. Either way a counter is
+  the answer.
+- **Re-read the pointer after publishing and confirm the version and code hash
+  are the ones you meant.** A publish at an already-used version is a silent
+  no-op *success* — the contract deliberately does not error on a stale update,
+  because that would turn ordinary anti-entropy from a behind peer into a merge
+  failure. The network will never tell you your release was ignored.
+- **If you lose the counter's store, recover the version from the network, and
+  only from a record that verifies under your own key.** A counter that restarts
+  makes every later publish a no-op success, freezing the pointer at a
+  generation you are no longer writing to. Adopting an *unverified* read-back is
+  the opposite failure and is worse: nobody else can move your pointer, since
+  only your key signs a record the contract accepts, so a peer that answers with
+  a forged high version simply gets **you** to sign the next one just below the
+  ceiling. `MAX_POINTER_VERSION` is `u32::MAX - 1` because `u32::MAX` itself is
+  reserved: a record there could never be superseded. Monotonicity means you
+  cannot walk a version back down.
 - **PUT the committed, published WASM artifact; never a local rebuild.** A local
   rebuild puts your pointer at an address nobody else derives: invisible to every
   consumer, and indistinguishable from success on your side.
