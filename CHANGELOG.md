@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.38.2 (2026-10-06)
+
+**`dapp-builder` now explains what reads cost: a GET for a key nobody has PUT
+is slow, and serialized GETs add up.** A live directory app took about 100
+seconds to show all its content. It sharded data by month × category, and on
+every load it GETted about 13 shards nobody had written yet, one after another.
+Each `NotFound` took 4–14 seconds at the node, while every contract the gateway
+already held came back in milliseconds. The skill already told authors to shard
+by time-window, but said nothing about how readers find out which shards exist.
+`references/ui-patterns.md` gains a "Reading Contracts Efficiently" section:
+list shards in a manifest readers already fetch, keep optional reads off the
+critical path, treat a cached `NotFound` only as a short-lived hint (kept in a
+delegate, since a published webapp has no browser storage), and send independent
+GETs concurrently, which needs stdlib TS 0.4.0 or later. The State Size Budget
+bullet in Phase 1 now points there. Also corrects three places that still said
+npm's latest stdlib TS package was 0.3.0; 0.4.0 has been published since
+2026-08-31.
+
 ## 1.38.1 (2026-09-25)
 
 **`dapp-builder` now strongly recommends that every dApp shows a way to reach
