@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.39.0 (2026-10-19)
+
+**`release` now opens with MANDATORY PRECONDITIONS before any trigger step.**
+The pre-cut gates previously lived only in one maintainer's local skill, so a
+session using `freenet:release` alone had no soak or auto-update gate and nearly
+cut a release without them. The skill now requires, before `release.yml` is
+dispatched: P0 no concurrent cut; P1 the auto-update updater diff and both
+canary self-test suites; P2 a 30-minute real-NAT soak of the exact ship SHA
+(clean non-`-dirty` build, River room check through the iframe, a
+subscribe/UPDATE test message, log and behaviour watch); P3 a pre-cut telemetry
+baseline; P4 reporting each gate. Post-cut telemetry monitoring through the
+0-4h auto-update stagger is now Step 6 (P5) and part of the success criteria.
+Environment-specific soak recipes stay in maintainers' local `freenet-release`
+skill, which this skill points to. Also: a `dry_run=true` dispatch is
+documented as a real trigger (its version-bump job still opens and auto-merges
+the release PR); Step 3 watches the tag's `cross-compile.yml` run, where Gate A,
+Gate B and the crates.io publish actually run, and checks that the shipped tag
+differs from the soaked SHA only in version files; the updater diff covers
+`update/`, `service/`, `rollback.rs` and the wiring test; machine-specific
+gateway names were removed; and a generic Windows-signing failure note was added.
+
 ## 1.38.7 (2026-10-18)
 
 **`dapp-builder` documents merge-law compliance.** A new
