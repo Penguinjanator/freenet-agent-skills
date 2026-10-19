@@ -10,14 +10,14 @@ license: LGPL-3.0
 This is the **single entry point** for cutting a freenet-core release. The order is fixed:
 
 1. **MANDATORY PRECONDITIONS** P0-P4 (below). Every one must pass, and you must report each result.
-2. Steps 1-5: version, trigger, watch, verify artifacts, River smoke test.
-3. **Step 6 (precondition P5): post-cut telemetry monitoring** through the 0-4h auto-update stagger.
+2. Steps 1-5: version, trigger, watch (including the ship-vs-soak check **before** the tag is pushed), verify artifacts, River smoke test.
+3. **Step 6: post-cut telemetry monitoring** through the 0-4h auto-update stagger.
 
 **Do not dispatch `release.yml` or run `scripts/release.sh` until P0-P4 have passed.** No "quick release", "routine patch" or "CI is green" path skips them. The only thing you may run beforehand is `scripts/release.sh --dry-run`.
 
 **A `dry_run=true` dispatch of `release.yml` is NOT side-effect free.** Its version-bump job has no dry-run guard, so it pushes a release branch, opens a real `build: release X.Y.Z` PR and auto-merges it into `main`. That makes it a trigger: it needs the preconditions too, and it moves `main` past the SHA you soaked.
 
-The release pipeline runs entirely in GitHub Actions: version bump, then release PR, CI gate, crates.io publish, GitHub release, and cross-compiled binaries. The `release.published` event then auto-triggers `gateway-update.yml` (which HMAC-POSTs each gateway's release-agent) and `release-announce.yml` (Matrix and River posts). CI does **not** exercise a real NATed peer, and it does not exercise the shipping binary's own updater. That is why the preconditions exist.
+The release pipeline runs entirely in GitHub Actions: version-bump PR, merge-queue CI gate, `cargo publish --dry-run`, tag and draft GitHub release, cross-compiled binaries, Gate A, crates.io publish, then un-draft. The `release.published` event then auto-triggers `gateway-update.yml` (which HMAC-POSTs each gateway's release-agent) and `release-announce.yml` (Matrix and River posts). CI does **not** exercise a real NATed peer, and it does not exercise the shipping binary's own updater. That is why the preconditions exist.
 
 ## MANDATORY PRECONDITIONS: run all of these before ANY trigger
 
@@ -100,7 +100,8 @@ The P2 soak peer runs with auto-update **enabled**. It is the only real-NAT obse
 
 Unit, simulation and CI tests miss regressions that only real subscription and UPDATE traffic over a NAT link surface. Examples are the #4345 GET-stream-assembly failures, connection-teardown bugs and log spam. All of the following are required:
 
-- **Exact ship SHA.** Build the `origin/main` HEAD that the release will tag. If `main` moves before you trigger, the soak no longer covers what ships, so re-soak the new SHA.
+- **Exact ship SHA.** Build the SHA the bump PR will sit on top of: the current `origin/main` HEAD. The release is tagged on the bump PR's merge commit, so the version bump should be the only thing separating the tag from what you soaked. If `main` moves before you trigger, the soak no longer covers what ships, so re-soak the new SHA. Step 3 checks this again the moment the bump PR merges.
+- **Merge freeze from soak start until the bump PR merges.** Nothing may merge to freenet-core `main` in that window, including PRs queued ahead of the bump PR in the merge queue. Any such merge moves `main` off the soaked SHA, so the release would ship code the soak never ran, and a soak-gate hook will refuse the cut. Ask the user to declare a merge freeze before you start the soak. Do not enqueue or auto-merge your own PRs in that window, and disable auto-merge on any that are pending (`gh pr merge <N> --repo freenet/freenet-core --disable-auto`). If anything merges in the window anyway, re-soak the new `origin/main` HEAD.
 - **Clean, non-dirty build.** `git status --short` must be empty, **including untracked files**. `build.rs` stamps the build from `git status --porcelain`, and **a `-dirty` build has auto-update DISABLED**, so a soak of a dirty binary proves nothing about the updater (freenet-core#5613). Check the **artifact**: `freenet --version` on the soak peer must show the ship SHA with no `-dirty` suffix.
 - **A real NATed peer, upgraded to that binary.** It must not be a gateway, a loopback simulation or a datacenter host with a public IP. Auto-update must stay enabled on it (see P1).
 - **River room check.** On the soak peer's own node, the Freenet Official room must load: members render, the composer is present, it is not stuck on "Subscribing…", and there is no WASM panic. River renders inside an **iframe**, so assertions against the top-level document see an empty page and report a healthy room as dead. Select the content frame.
@@ -137,7 +138,8 @@ Before Step 2, tell the user which gates ran and what each returned: P0-P3, plus
 ## Arguments
 
 - If an argument is provided (e.g., `/release 0.2.65`), use it as the target version.
-- If no argument is provided, auto-detect: increment the patch of the version currently in `crates/core/Cargo.toml`. If unreleased PRs have already bumped it past the last tag, **use the current Cargo.toml version as-is** rather than incrementing again. That is the version those PRs were intended for.
+- If no argument is provided, work it out from `crates/core/Cargo.toml`: increment its patch. If unreleased PRs have already bumped it past the last tag, **use the current Cargo.toml version as-is** rather than incrementing again. That is the version those PRs were intended for.
+- **Always pass the chosen version to the workflow explicitly (`--field version=X.Y.Z`). Never leave `version` blank.** A blank input makes `release.yml` auto-bump the patch of the latest **crates.io** release, which ignores `Cargo.toml` and can differ from the version you confirmed with the user.
 
 ## Step 1: Determine Version and Show Changelog
 
@@ -156,52 +158,124 @@ Pick the target version (see Arguments above). Present the user with the current
 
 ## Step 2: Trigger the Release Workflow
 
-**Only after P0-P4 have passed for the current `origin/main` SHA.**
+**Only after P0-P4 have passed for the current `origin/main` SHA.** Run Steps 2 and 3 from the up-to-date freenet-core checkout from Step 1.
 
 ```bash
-gh workflow run release.yml --repo freenet/freenet-core --field version=X.Y.Z
+VER=X.Y.Z                                     # the version confirmed in Step 1
+SOAKED=<the SHA you soaked in P2>
+T0=$(date -u +%FT%TZ)                         # recorded BEFORE the trigger; used to ignore older runs and PRs
+gh workflow run release.yml --repo freenet/freenet-core --field version="$VER"
 ```
 
 Inputs (see `gh workflow view release.yml --yaml`):
 
-- `version`: leave blank to auto-patch-bump from the latest crates.io release.
+- `version`: **always set it explicitly** to the version confirmed in Step 1. Never leave it blank: blank auto-bumps from the latest crates.io release, not from `Cargo.toml` (see Arguments).
 - `skip_tests`: skips the pre-release local tests (CI still runs on the PR).
 - `dry_run`: skips the tag and the GitHub release, **but still opens and auto-merges the version-bump PR**. Treat it as a real trigger.
 
-Confirm the run started:
+Get the id of the run you just started. `gh run list --limit 1` right after the trigger often still returns the previous run, so filter by `T0`:
 
 ```bash
-gh run list --workflow release.yml --repo freenet/freenet-core --limit 1 \
-    --json databaseId,status,event,createdAt
+RUN_ID=""
+until [ -n "$RUN_ID" ]; do
+  RUN_ID=$(gh run list --workflow release.yml --repo freenet/freenet-core --event workflow_dispatch --limit 5 \
+      --json databaseId,createdAt -q "[.[] | select(.createdAt >= \"$T0\")][0].databaseId // empty")
+  [ -n "$RUN_ID" ] || sleep 10
+done
+echo "release run: $RUN_ID"
 ```
 
 ## Step 3: Watch the Release Run
 
-The workflow takes about 20-30 minutes. Use `gh run watch` in a backgrounded call so you are notified on completion; never poll by hand.
+`release.yml` runs these jobs in order:
+
+1. `validate`
+2. `update_versions` pushes branch `release/v$VER`, opens the `build: release X.Y.Z` PR (about a minute after the trigger) and enables auto-merge.
+3. `wait_for_pr` waits roughly 20-75 minutes for the merge queue, then resolves the PR's merge commit as the release SHA.
+4. `verify_publishable` runs `cargo publish --dry-run` (about 4-5 minutes).
+5. `create_release` pushes the `vX.Y.Z` tag on the release SHA and creates the draft release, seconds after `verify_publishable` finishes.
+
+The whole run takes roughly 30-60 minutes. The tag push starts the tag's `cross-compile.yml` run, which publishes to crates.io and un-drafts the release; that starts the 0-4h auto-update stagger.
+
+### Check that what ships is what you soaked, BEFORE the tag is pushed
+
+Anything that landed on `main` while the bump PR sat in the queue is in the release SHA. Check it **as soon as the bump PR merges**. Between that merge and the tag push there are only the 4-5 minutes of `verify_publishable`, too little to notice a failure and cancel by hand. So start this script in a **backgrounded** call right after you have `RUN_ID`. It cancels the run itself if the check fails:
 
 ```bash
-VER=X.Y.Z                                                      # the version being released; used below
-RUN_ID=$(gh run list --workflow release.yml --repo freenet/freenet-core --limit 1 --json databaseId -q '.[0].databaseId')
-gh run watch "$RUN_ID" --repo freenet/freenet-core --interval 30 --exit-status
-gh run view "$RUN_ID" --repo freenet/freenet-core --log-failed | tail -100   # on failure
+# 1. Wait for THIS run's bump PR. Its head branch is always release/v$VER, but older
+#    attempts at the same version can share that branch, so ignore PRs created before T0.
+PR=""
+until [ -n "$PR" ]; do
+  PR=$(gh pr list --repo freenet/freenet-core --head "release/v$VER" --state all --json number,createdAt \
+      -q "[.[] | select(.createdAt >= \"$T0\")][0].number // empty")
+  [ -n "$PR" ] || sleep 15
+done
+# 2. Wait for it to leave OPEN. Stop if the release run ends first (e.g. wait_for_pr timed out).
+while STATE=$(gh pr view "$PR" --repo freenet/freenet-core --json state -q .state); [ "$STATE" = OPEN ]; do
+  [ "$(gh run view "$RUN_ID" --repo freenet/freenet-core --json status -q .status)" = completed ] \
+    && { echo "release run ended while bump PR #$PR is still OPEN; investigate"; exit 1; }
+  sleep 15
+done
+[ "$STATE" = MERGED ] || { echo "bump PR #$PR is $STATE, not merged; the run will not tag. Investigate"; exit 1; }
+# 3. mergeCommit can lag behind MERGED for a few seconds.
+MERGE_SHA=""
+until [[ "$MERGE_SHA" =~ ^[0-9a-f]{40}$ ]]; do
+  MERGE_SHA=$(gh pr view "$PR" --repo freenet/freenet-core --json mergeCommit -q '.mergeCommit.oid // empty')
+  [[ "$MERGE_SHA" =~ ^[0-9a-f]{40}$ ]] || sleep 5
+done
+# 4. The diff must be exactly the version files. Anything else: cancel before the tag.
+git fetch -q origin
+EXTRA=$(git diff --name-only "$SOAKED" "$MERGE_SHA" | grep -vxE 'Cargo\.lock|crates/core/Cargo\.toml|crates/fdev/Cargo\.toml')
+if [ -n "$EXTRA" ]; then
+  gh run cancel "$RUN_ID" --repo freenet/freenet-core --force
+  echo "SOAK MISMATCH: release SHA $MERGE_SHA differs from soaked $SOAKED in:"; echo "$EXTRA"
+  exit 1
+fi
+echo "OK: $MERGE_SHA differs from $SOAKED only in version files"
 ```
 
-`release.yml` going green is **not** the end. The tag push starts a `cross-compile.yml` run, and that run builds the binaries, runs **Gate A** (which blocks publish), publishes to crates.io, un-drafts the release and runs **Gate B**. Watch that run too:
+`--force` matters: `verify_publishable` and `create_release` carry `if: always()`, which a plain cancel does not override. If the script reports a mismatch, or you cancel for any other reason, **keep both safety checks**:
 
 ```bash
+gh run view "$RUN_ID" --repo freenet/freenet-core --json status,jobs \
+    -q '.status, (.jobs[] | "\(.name): \(.status) \(.conclusion)")'    # "Create GitHub release" must not be success
+git ls-remote --tags origin "v$VER"                                       # must print nothing
+```
+
+Ignore the `Release summary` job's log after a cancel. It is `if: always()` and can still say the release was cut.
+
+If the cancel lost the race and `v$VER` exists, act fast. The tag's `cross-compile.yml` run reaches `attach-to-release` about 25 minutes after the tag push, and that job runs Gate A and then publishes to crates.io. Cancel it first:
+
+```bash
+CC_ID=$(gh run list --workflow cross-compile.yml --repo freenet/freenet-core --branch "v$VER" --limit 1 \
+    --json databaseId -q '.[0].databaseId')
+gh run cancel "$CC_ID" --repo freenet/freenet-core --force
+curl -s https://crates.io/api/v1/crates/freenet | jq -r .crate.max_version   # must be the PREVIOUS version, not $VER
+```
+
+`--force` also stops the `always()` canary-failure notifier. If it posts anyway, add a note to the dev channel saying the cancel was deliberate and is not an auto-update failure.
+
+**If crates.io already shows `$VER`, the crates are published. Do NOT roll back; stop and escalate to the user.** Otherwise, delete the tag and the draft release. `release-rollback.sh` must run from the root of a freenet-core checkout, because it uses that checkout's git remote. It asks for an interactive `yes`; in a non-interactive shell, pipe it in, or it aborts and deletes nothing:
+
+```bash
+cd <your freenet-core checkout>
+printf 'yes\n' | ./scripts/release-rollback.sh --version "$VER"   # deletes the tag and the GitHub release; no --yank-crates
+git ls-remote --tags origin "v$VER"                               # must now print nothing
+```
+
+Either way, the version-bump commit stays on `main` and nothing was published, so tell the user what happened. Any re-cut starts again from P0 with a soak of the new `origin/main` HEAD. Agree the version with the user. Re-using `$VER` is fine, because nothing was published or tagged, but it creates a second `build: release $VER` PR on the same branch name; the `T0` filter above handles that. The alternative is the next patch.
+
+### Watch the tag's cross-compile run
+
+`release.yml` going green is **not** the end. The tag push starts a `cross-compile.yml` run, and that run builds the binaries, runs **Gate A** (which blocks publish), publishes to crates.io, un-drafts the release and runs **Gate B**. Watch that run too, and the release run itself, each with `gh run watch` in a backgrounded call; never poll by hand:
+
+```bash
+gh run watch "$RUN_ID" --repo freenet/freenet-core --interval 30 --exit-status
+gh run view "$RUN_ID" --repo freenet/freenet-core --log-failed | tail -100   # on failure
 gh run list --workflow cross-compile.yml --repo freenet/freenet-core --branch "v$VER" --limit 1 \
     --json databaseId,status,conclusion
 gh run watch <that id> --repo freenet/freenet-core --interval 30 --exit-status
 ```
-
-**Check that what shipped is what you soaked.** The tag is the commit the version-bump PR merged as, and that PR waits roughly 20-75 minutes in the merge queue. Anything that landed on `main` in that window ships too.
-
-```bash
-git fetch --tags origin
-git diff --stat <soaked-sha> "v$VER"   # must touch only version files (Cargo.toml/Cargo.lock/changelog)
-```
-
-If the diff touches anything else, the soak did not cover the release. Treat that like a soak failure: tell the user, and decide between soaking the tag and watching closely, or rolling back.
 
 ## Step 4: Verify the Release Artifacts
 
@@ -229,16 +303,19 @@ Both cascade runs should show recent runs started after the release. If either i
 
 ## Step 5: River Compatibility Smoke Test
 
-Protocol changes can silently break River clients even when every freenet-core test passes. Examples are new wire variants, streaming defaults and serialization changes. Get the current Freenet Official room owner VK from the `river-official-room` skill; it rotates, so do not hardcode it.
+Protocol changes can silently break River clients even when every freenet-core test passes. Examples are new wire variants, streaming defaults and serialization changes.
+
+`ROOM_VK` is the Freenet Official room's **owner verifying key**. Take it from the "Room Owner VK" entry in the maintainer-local `river-official-room` skill; without that skill, ask the room owner. It changes when the room is re-created, so look it up each release and do not hardcode it.
 
 ```bash
+ROOM_VK=<Room Owner VK from the river-official-room skill>
 cd <your river checkout>
 cargo run -p riverctl -- member list "$ROOM_VK"
 ```
 
 A bincode deserialization error means **STOP**: roll back (see "Rollback"), file an issue, and rebuild River against the new stdlib. In v0.2.11, enabling WebSocket streaming by default broke riverctl, which was pinned to stdlib 0.1.40.
 
-## Step 6 (precondition P5): Post-cut telemetry monitoring through the 0-4h stagger
+## Step 6: Post-cut telemetry monitoring through the 0-4h stagger
 
 Peers adopt a release over a **0-4h decentralised-discovery stagger**, so a regression in the shipped binary keeps spreading for hours after the gateways look fine. Keep monitoring until the stagger has fully elapsed. The release is not done when the workflow goes green.
 
@@ -256,6 +333,7 @@ Watch for log spam (it can fill disks within hours), new error patterns, connect
 ## Rollback
 
 ```bash
+# From the root of a freenet-core checkout. Each prompts for "yes"; pipe it in a non-interactive shell.
 ./scripts/release-rollback.sh --version <VERSION>                # keeps crates.io
 ./scripts/release-rollback.sh --version <VERSION> --yank-crates  # disruptive; undo with cargo yank --undo
 ./scripts/release-rollback.sh --version <VERSION> --dry-run
@@ -292,7 +370,7 @@ The release is complete when all of these hold:
 
 - ✓ P0-P4 passed and were reported **before** the trigger, and the soak covered the exact ship SHA for 30 minutes
 - ✓ the `release.yml` workflow succeeded, AND the tag's `cross-compile.yml` run succeeded, including Gate A and Gate B
-- ✓ `git diff <soaked-sha> vX.Y.Z` touches only version files
+- ✓ `git diff <soaked-sha> <bump PR merge commit>` touched only version files, checked **before** the tag was pushed
 - ✓ crates.io shows the new version for both `freenet` and `fdev`
 - ✓ the GitHub release is tagged, with all required binaries attached
 - ✓ the `gateway-update.yml` and `release-announce.yml` cascade runs succeeded
