@@ -92,7 +92,7 @@ Either store the originating signed events (e.g., a log of `AuthorizedPurge` act
 
 ### Monotonic Counter
 
-For replaceable signed envelopes (Configuration, RecipientState). Each new version must have `counter > previous`. Replay of older signed states is rejected.
+For replaceable signed envelopes (Configuration, RecipientState). Each new version must have `counter > previous`. A replayed older signed state has no effect: the merge keeps the higher version.
 
 ```rust
 pub struct RecipientState {
@@ -107,13 +107,13 @@ Counter goes in the bytes covered by the signature, so signatures are bound to a
 
 ### Tombstones
 
-For "forgotten but must not return" state. River bans persist as tombstones — re-invitation attempts of banned members are rejected. The inbox's purged list works the same way: explicitly-purged messages can't be re-submitted.
+For "forgotten but must not return" state. River bans persist as tombstones: while the ban is held, a banned member's record is dropped on every merge, including after a re-invitation. The inbox's purged list works the same way: explicitly-purged messages can't be re-submitted.
 
 ```rust
 pub struct RecipientState {
     pub version: u64,
     /// Truncated fast_hash of purged message signatures.
-    /// AppendMessages whose hash matches an entry here are rejected.
+    /// AppendMessages whose hash matches an entry here are dropped.
     pub purged: Vec<u32>,
 }
 ```
@@ -274,19 +274,24 @@ Put the timestamp **inside the state, in the client-signed payload**, and have t
 
 ```rust
 // timestamp_ms is part of the signed payload, so every peer evaluating this
-// update sees the same value and reaches the same state.
-if new_beacon.timestamp_ms <= current.timestamp_ms {
-    return Err(/* not newer than what we hold */);
-}
+// update sees the same value and reaches the same state. A state that is not
+// newer is ignored rather than refused: returning Err here would make
+// merge(A, A) and merge(newer, older) fail. Equal timestamps are broken by the
+// whole state's bytes, so the result does not depend on arrival order even if
+// some field is not covered by the signature.
+let incoming_wins = (new_beacon.timestamp_ms, incoming_state.as_ref())
+    > (current.timestamp_ms, current_state.as_ref());
+let next = if incoming_wins { incoming_state } else { current_state };
+Ok(UpdateModification::valid(next))
 ```
 
-`freenet-weather` is the worked example: `BeaconState.timestamp_ms` is signed by the announcing client, the contract's only check is `new > current`, and there is no clock call anywhere in it.
+`freenet-weather` uses this shape for its timing: `BeaconState.timestamp_ms` is signed by the announcing client and there is no clock call anywhere in the contract. Its `update_state` does return `Err` for a state that is not newer, which the code above avoids (see `merge-law-compliance.md` → "A validly signed record never makes a merge fail").
 
 **Be clear about what this loses.** A client-supplied timestamp is an *untrusted hint*. It is fine for ordering and ranking, and it cannot do the anti-grief job a host-clock skew check was doing, because the party asserting the time is the party being checked — set it far in the future and the check passes. Swapping in a client timestamp while still treating it as authoritative moves the bug rather than fixing it.
 
 The two shapes that show up in practice:
 
-- **Anti-grief on a per-author log** (the common case): cap the log by *count*, or key it on a monotonic counter. A client-supplied timestamp must not be an eviction key.
+- **Anti-grief on a per-author log** (the common case): cap the log by *count*, or key it on a monotonic counter. A client-supplied timestamp must not decide whose records are evicted; within one author's own records it may, because an author who future-dates only displaces their own entries.
 - **Capability expiry** (rare, and the genuinely hard one): there is no clean in-contract substitute, because the party asserting the time is the party being checked. The available shapes are a sequence number plus a revocation record, or enforcing expiry outside the contract.
 
 **The sharp edge in the usual replacement.** The obvious substitute for a retention window is to derive it from the state's own newest timestamp — a logical clock. That has a real failure mode: one future-dated entry sets the reference permanently, degrading every peer's view from then on with nothing to heal it, where a wall-clock rule would have recovered on its own once real time caught up. If you take this route, bound how far the reference may advance in one update, or use a count cap instead. The migration off the clock is not free; budget for it.
@@ -318,8 +323,11 @@ Replay protection for old messages should use signature-based dedup (signatures 
 ### Checking a Contract
 
 ```bash
-fdev verify-merge --wasm your_contract.wasm --state s1.bin --state s2.bin
+fdev verify-merge --wasm your_contract.wasm --params params.bin \
+  --state s1.bin --state s2.bin
 ```
+
+Pass the contract's parameters with `--params`: without it fdev uses empty parameters, a contract whose parameters do not decode from empty bytes, or fail its checks, rejects or fails on every state, every case comes back inconclusive, and the command still exits 0.
 
 It reports a `host_clock_import` **code diagnostic** when the module imports the clock. That is a diagnostic about the code, not a law the contract broke: it does not fail the command, and it is never grounds for removing a contract from the network. The node's warning and this diagnostic come from the same detector, so the developer-facing answer and the node-facing answer cannot disagree.
 
@@ -368,7 +376,7 @@ Host fetches the requested contracts (locally first, then network) and re-invoke
 ### Limits
 
 - **Depth = 1.** A contract returning `RequestRelated` on the second pass is a logic error — host rejects.
-- **Max 10 related contracts per request** (`MAX_RELATED_CONTRACTS_PER_REQUEST`). Give the state a *structural* bound — fixed typed slots rather than an open-ended list other parties can extend — so an eleventh reference cannot arise. A count cap is a poor fallback here, because whichever reference truncation drops is one the contract needed, and and the limit is not yours to enforce anyway — the **host** rejects the request outright when a contract asks for more than ten, so the operation fails rather than your `validate_state` returning `Invalid`. Where the set of things to consult is genuinely open-ended, replace the live read with a signed attestation carried in the entry — see "Never Gate an Item's Validity on a Value That Can Decrease" — so there is nothing to fetch and no limit to hit.
+- **Max 10 related contracts per request** (`MAX_RELATED_CONTRACTS_PER_REQUEST`). Give the state a *structural* bound — fixed typed slots rather than an open-ended list other parties can extend — so an eleventh reference cannot arise. A count cap is a poor fallback here, because whichever reference truncation drops is one the contract needed, and the limit is not yours to enforce anyway — the **host** rejects the request outright when a contract asks for more than ten, so the operation fails rather than your `validate_state` returning `Invalid`. Where the set of things to consult is genuinely open-ended, replace the live read with a signed attestation carried in the entry — see "Never Gate an Item's Validity on a Value That Can Decrease" — so there is nothing to fetch and no limit to hit.
 - **10s fetch timeout per request.** Multiple bogus references multiply the latency cost.
 
 ### Requesting Related State From `update_state`
