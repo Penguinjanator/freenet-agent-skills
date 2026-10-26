@@ -578,7 +578,9 @@ Set up the build system, CI, and deployment pipeline.
 References:
 - `references/build-system.md` — build, CI, packaging, tooling
   preflight, per-contract lockfile isolation, contract-ID
-  reproducibility caveat, pre-commit hook for stray `.wasm`.
+  reproducibility caveat, pre-commit hook for stray `.wasm`, and building
+  signature/hash crates at `opt-level = 3` for contracts that verify many
+  signatures (with the per-call WASM time budget).
 - `references/production-smoke-testing.md` — iframe shell architecture,
   Playwright recipe for post-publish liveness checks.
 - `references/web-container-contract.md` — how a webapp is addressed and

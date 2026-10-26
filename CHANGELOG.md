@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.39.6 (2026-10-26)
+
+**`dapp-builder`: build signature and hash crates for speed in signature-heavy contracts.**
+
+- `references/build-system.md` gains a section on building `curve25519-dalek`,
+  `ed25519-dalek`, `sha2` and `blake3` at `opt-level = 3` while the rest of the
+  contract stays at `"z"`: `verify_strict` drops from 327 us to 227 us per
+  signature in a wasmtime host configured like freenet-core's engine (median of
+  5 runs). It records that forcing the 64-bit curve backend on `wasm32` is about
+  2x slower, that `ed25519-compact` is slower too, that a profile change re-keys
+  the contract, and how to budget the node's 5 s per-call limit (an incoming
+  full-state update runs `validate_state` twice plus `update_state`) by measuring
+  the largest valid state in WASM. Native-speed verification is freenet-core#6000.
+
 ## 1.39.5 (2026-10-21)
 
 **`dapp-builder` merge-law guidance corrected after an accuracy audit.**

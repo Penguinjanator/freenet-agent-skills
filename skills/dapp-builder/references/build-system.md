@@ -784,6 +784,60 @@ panic = "abort"      # Smaller binary
 opt-level = "z"
 ```
 
+### Signature-heavy contracts: build the crypto crates for speed
+
+`opt-level = "z"` makes signature verification about 1.4x slower than
+`opt-level = 3`. For a contract whose `validate_state` or `update_state` checks
+many signatures, that is often the difference between fitting the node's per-call
+time limit and not. Build only the signature and hash crates for speed and leave
+everything else at `"z"`:
+
+```toml
+[profile.release.package.curve25519-dalek]
+opt-level = 3
+[profile.release.package.ed25519-dalek]
+opt-level = 3
+[profile.release.package.sha2]
+opt-level = 3
+[profile.release.package.blake3]
+opt-level = 3
+```
+
+Measured 2026-10-26: ed25519-dalek 2.2 `verify_strict`, one fixed signature
+verified 2,000 times per run inside a wasmtime 47 host configured like
+freenet-core's engine (Cranelift `OptLevel::None`, 256 MiB reservation, epoch
+interruption, fuel off), median of 5 runs, on an Intel i9-9900K under load 3-9:
+
+| Guest build | per signature |
+|---|---|
+| crypto crates at `opt-level = "z"` | 327 us |
+| crypto crates at `opt-level = 3` | 227 us |
+| `--cfg curve25519_dalek_bits="64"` (forced 64-bit backend) | 741 us |
+| `ed25519-compact` instead of ed25519-dalek | 720 us or more |
+| native (same CPU, for comparison) | 42-46 us |
+
+The WASM file grows (38 KB to 60 KB for the benchmark guest; River's next room
+contract went from 799 KB to 811 KB). Do not force the 64-bit curve backend on
+`wasm32`: WASM has no 64x64-to-128-bit multiply, so the emulated multiplies make
+it about 2x slower than the default 32-bit backend.
+
+**Changing a profile changes the contract's WASM, and therefore its key.** Apply
+this to a new contract, or as part of a planned re-key with migration
+(`references/upgrade-and-migration.md`), never as a quiet rebuild of a deployed
+contract.
+
+**Budget the time per call, measured in WASM.** The node limits each contract
+call to 5 s. One incoming full-state update runs `validate_state` on the incoming
+state, `update_state`, then `validate_state` on the result, each a separate call,
+so the largest valid state AND the merge of two such states must each finish
+well under that limit. Native `cargo test` timings say nothing about this: in
+WASM a signature check costs about 5-8x native. Build the largest state your caps
+allow, time `validate_state` and `update_state` on the release WASM in a wasmtime
+host with the settings above, and set the caps from that measurement. If the caps
+you need still do not fit, the limit is signature cost inside WASM; native-speed
+verification for contracts is tracked in
+[freenet-core#6000](https://github.com/freenet/freenet-core/issues/6000).
+
 ## Build Verification
 
 River's CLI includes build verification to prevent deploying stale contracts:
